@@ -407,3 +407,11 @@ Second controlled run (5 rounds, same finger, logs include cover=): match at cov
 coverage >= ~60%: 8/8 swipes at >=63% matched, 5/5 at <=56% failed. Rows alone are not
 predictive (a 300-row/51% scan scored 5). If match reliability must improve further, the
 lever is the enrolled template (enroll with >=65% coverage swipes), not the threshold.
+
+## Dry skin / ridge contrast (2026-10-25, final measurement)
+Scores for the same finger varied 38-122 across a session while coverage stayed high.
+Low-contrast probes (std 20-33) clustered below the 40 threshold even at 62-72% coverage,
+i.e. contact area alone is not sufficient. After breathing on the fingertip (light moisture),
+three consecutive verifies matched (scores 57, 40, 41) at coverage 61-66%. Practical advice:
+full-pad flat contact + slightly moist skin + slow swipe; re-swipe when the bridge logs
+"partial contact" (the prompt stays open).

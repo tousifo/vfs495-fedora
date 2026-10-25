@@ -35,6 +35,14 @@ then yes. This is the **Falcon**‑generation Validity swipe sensor (older than 
 - ✅ Decode + **descramble** the raw scan lines into a real image.
 - ✅ Get **match‑quality** assembled fingerprints (motion‑compensated).
 - ✅ **Enroll & verify** through `fprintd`; **PAM login / sudo** with your fingerprint.
+- ✅ **Fedora 44 status (verified 2026-10-25):** PAM authentication works end‑to‑end (a polkit
+  prompt was approved by fingerprint). Two Fedora‑specific fixes are required and packaged in
+  `packaging/fedora/`: disable libfprint's `virtual_image` thermal guard
+  (`FP_VIRTUAL_IMAGE_HOT_SECONDS=-1`) — otherwise authentication suddenly fails forever with
+  *"Device disabled to prevent overheating"* — and let the bridge reject incomplete swipes.
+  Measured on this machine: swipes covering ≥ 60 % of the sensor frame matched every time
+  (scores 40–122); swipes with less contact never did. With a slightly moist fingertip and
+  full‑pad contact, 3/3 consecutive verifies matched.
 - ⚠️ The secure session (SSLv3) is **fully reverse‑engineered and byte‑exact validated**, but the
   sensor enforces a pairing/provisioning gate we could not cross from the host — so, like every
   other VFS495 project, we let HP's proprietary binary establish the session (see
@@ -118,9 +126,15 @@ fprintd (NBIS minutiae + bozorth3)  →  enroll / verify  →  PAM (login, sudo,
 ## Troubleshooting
 
 - **Swipe timing.** When a prompt appears (login, `sudo`, `fprintd-enroll`), the sensor needs about
-  2 seconds to arm (HP's binary is started and initialises the secure session). **Wait a moment,
-  then swipe slowly**, whole fingertip, one steady motion. A swipe made instantly after the prompt
-  is usually missed; just swipe again — the capture waits up to 60 s and retries once.
+  3 seconds to arm (HP's binary is started and initialises the secure session). **Wait a moment,
+  then swipe slowly**, whole finger pad flat on the sensor, one steady full‑length motion. A swipe
+  made instantly after the prompt is usually missed; just swipe again — the bridge makes up to
+  three 18‑second capture attempts inside one prompt.
+- **Contact is everything on this sensor.** The bridge logs `cover=NN%` for every scan. Swipes
+  covering ≥ 60 % of the frame matched in every measured case (scores 40–122); below ~60 % they
+  scored 3–39 and never matched. Press the whole pad flat (not just the tip) and use even pressure.
+  Dry skin lowers ridge contrast dramatically: breathing on the fingertip fixed a 3/3 run here.
+  When a swipe is rejected as `partial contact`, the prompt is still open — swipe again.
 - **See what happened.** `sudo journalctl -u vfs495-bridge -f` shows *finger needed → swipe now*,
   *delivered scan*, or *no finger captured*. `sudo journalctl -u fprintd | grep score` shows the
   matcher's score for every swipe (**≥ 40 = match**).

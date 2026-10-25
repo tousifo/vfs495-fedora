@@ -44,15 +44,19 @@ as fallback, but you should keep an hour for plan B: password always works).
   for this pipeline and causes intermittent "fingerprint suddenly stopped working".
   Fix: `FP_VIRTUAL_IMAGE_HOT_SECONDS=-1` in the fprintd drop-in (upstream-documented
   env var; disables the model, "device can run continuously").
-- **Quality gate.** The bridge rejects frames whose height is < 180 rows or whose
-  pixel statistics are clearly unusable (std > 85 or > 25 % saturated pixels).
-  Delivered real swipes measured std 34–80 / < 7 % saturated; the broken frame
-  measured std 91–99 / 25–50 %. The gate is deliberately conservative: rejecting a
-  good swipe costs an attempt, while delivering a bad one only costs one no-match.
+- **Quality gate.** The bridge rejects a frame when it is shorter than 180 rows,
+  has clearly unusable pixel statistics (std > 85 or > 25 % saturated pixels), or
+  covers less than 60 % of the frame with fingerprint (`cover=` in the log).
+  Calibration on this sensor: every swipe at ≥ 61 % coverage matched
+  (scores 40–122); every swipe at ≤ 58 % failed (best 39/40). The gate turns a
+  guaranteed failed attempt into an immediate retry while the prompt is still
+  open. Tune with `VFS495_MIN_COVER` (e.g. `65` during enrollment).
+- Dry skin is the other big lever: ridge contrast (`std=`) drops and scores fall
+  even at full coverage. Breathing on the fingertip fixed a 3/3 run here.
 - Verify prompts are event-driven: fprintd signals `finger-needed` over D-Bus,
   the bridge starts exactly one capture, and a repeat `VerifyStart` inside one
-  authentication re-delivers/retries. Swipes made before the sensor arms (~2 s)
-  are missed; swipe again.
+  authentication re-delivers/retries. Swipes made before the sensor arms (~3 s)
+  are missed; the bridge retries up to 3 × 18 s inside one prompt.
 - Repeated back-to-back captures can push the sensor into short/degraded scans and
   even trigger USB re-enumeration; the bridge waits 2.5 s before retrying.
 - libfprint's bozorth3 threshold is 40; genuine full-length slow swipes score
