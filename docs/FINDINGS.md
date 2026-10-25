@@ -401,3 +401,9 @@ the prompt (the gdb capture tool needs ~2 s to attach), then one slow full-lengt
 swipe with even pressure. Bridge gate now rejects only hopeless partials (cover <40%),
 so a merely imperfect swipe is still delivered and may match; retries stay enabled
 within the same auth request.
+
+Second controlled run (5 rounds, same finger, logs include cover=): match at coverage
+66/79/63%, failure at 51/56%. Combined with the first run, the practical threshold is
+coverage >= ~60%: 8/8 swipes at >=63% matched, 5/5 at <=56% failed. Rows alone are not
+predictive (a 300-row/51% scan scored 5). If match reliability must improve further, the
+lever is the enrolled template (enroll with >=65% coverage swipes), not the threshold.

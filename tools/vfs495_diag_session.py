@@ -67,7 +67,7 @@ def analyze_round(since):
     scores = re.findall(r"score (\d+)/(\d+)", j)
     br = "\n".join(l for l in j.splitlines() if "vfs495-bridge" in l)
     dims = re.findall(r"delivered scan (\d+)x(\d+)(?: mean=(\d+) std=(\d+) dark=([\d.]+)%"
-                      r"(?: sat=([\d.]+)%)?)? after ([\d.]+)s", br)
+                      r"(?: sat=([\d.]+)%)?(?: cover=(\d+)%)?)? after ([\d.]+)s", br)
     msgs = re.findall(r"\[vfs495-bridge\] (.*)", br)
     return scores, dims, msgs
 
