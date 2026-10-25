@@ -396,8 +396,8 @@ Ten delivered scans correlated against their bozorth3 scores:
 - coverage 30% (std 11) -> scores 6
 Coverage = share of pixels differing from the flat background by >12 levels. Rows alone
 do not predict success (a 300-row scan at 61% coverage still failed). Technique that
-works on this sensor: place the whole finger pad flat on the sensor, wait ~3 s after
-the prompt (the gdb capture tool needs ~2 s to attach), then one slow full-length
+works on this sensor: place the whole finger pad flat on the sensor, start the swipe as
+the prompt appears (HP's tool is ready in ~0.5 s; measured), and use one slow full-length
 swipe with even pressure. Bridge gate rejects anything below 60% contact, which was uniformly a wasted attempt
 in every measurement (best score 39/40); retries stay enabled within the same auth
 request and the diagnostics tool raises an immediate "swipe again" cue.
@@ -415,3 +415,64 @@ i.e. contact area alone is not sufficient. After breathing on the fingertip (lig
 three consecutive verifies matched (scores 57, 40, 41) at coverage 61-66%. Practical advice:
 full-pad flat contact + slightly moist skin + slow swipe; re-swipe when the bridge logs
 "partial contact" (the prompt stays open).
+
+## Template structure: five sub-templates per print (2026-10-25, offline measurement)
+`fpi_print_bz3_match()` keeps an array of NBIS `xyt_struct` templates per `FpPrint` — one
+per enrollment stage (five on `virtual_image`) — and scores the probe against each in
+order, returning on the first score >= 40. The enrolled file
+`/var/lib/fprint/tousifo/virtual_image/0/7` (2291 bytes) therefore already contains five
+independent templates:
+
+```
+no-match probe -> 19/40; 31/40; 39/40; 23/40; 26/40    (all five tried)
+match probe    -> 19/40; 81/40                         (short-circuits on the pass)
+```
+
+Consequences: (a) an "extra enrollment" only helps if it adds templates that differ from
+the existing five; (b) fprintd 1.94 blocks re-enrolling a finger it can identify
+(`enroll-duplicate`: its identify-for-enroll step matches the current gallery), so extra
+templates must be built offline; (c) the score printed by fprintd is the *first passing*
+score, not necessarily the best one.
+
+## Offline scorer (tools/vfs495_score_image.py)
+Feeds archived PGM scans to libfprint's `virtual_image` driver over a private unix socket
+(`FP_VIRTUAL_IMAGE=<sock>`), with a copy of an enrolled print deserialized via
+`FPrint.Print.deserialize()`; no root, no sensor, no swipes. One print = `verify_sync`
+(same as fprintd with a single enrolled finger); two or more comma-separated prints =
+`identify_sync` (same as `VerifyStart("any")`). Verdicts reproduce the live journal.
+
+Implementation notes that cost time to discover:
+- Protocol is `<ii` width,height + raw 8-bit pixels, sent to the driver's socket.
+- `FP_VIRTUAL_IMAGE_HOT_SECONDS=-1` must be set or the thermal model can reject probes.
+- libfprint's `g_debug()` score line is written to **stdout**, not stderr (GLib's default
+  writer sends DEBUG/INFO to stdout). Capture both fds with a *pipe*: redirecting to a
+  file/`/dev/null` makes GLib bypass the redirect.
+- `G_MESSAGES_DEBUG=all` must be set before the first GLib log call (it is cached).
+
+## Second gallery print: more templates without touching the threshold (2026-10-25)
+An extra print was built offline from five scans that already scored well against the
+enrolled print (`tools/vfs495_build_print.py`, ENROLL mode + `serialize()`; 2959 bytes,
+five sub-templates). It was installed as a second gallery entry (finger code 8, same
+physical right index; filename must equal the print's finger metadata).
+
+Held-out scans (not used to build the print), with fprintd-equivalent identify over both:
+
+| scan | original best | gallery best | verdict |
+|---|---|---|---|
+| 200x244, contact 61% | 39/40 | **42/40** | MATCH (extra print) |
+| 200x300, std 44 | 23/40 | **56/40** | MATCH (extra print) |
+| 200x212, std 72 | 49/40 | 51/40 | MATCH (original) |
+| 200x222, std 35 | 17/40 | 18/40 | no-match |
+| 200x204, std 11 | 6/40 | 6/40 | no-match |
+
+Borderline swipes gain several points, hopeless assemblies stay hopeless. The original
+print is untouched; the extra file is additive and can be deleted (`.../0/8`). Cost:
+`fprintd-verify`/GNOME list a second finger name (cosmetic; same physical finger).
+
+## Image preprocessing does not rescue bad swipes (2026-10-25)
+Percentile stretch, histogram equalisation, CLAHE (clip 2/4), gamma 0.8/1.3, unsharp,
+black-hat and median variants of six archived scans moved best scores by -8…+11 with no
+consistent sign: only one of four failing scans crossed 40 (39 -> 42 with CLAHE clip 4),
+others regressed (17 -> 9 with the same filter). Mean best score: 35.8 raw vs 38.8 CLAHE,
+driven mostly by scans that already matched. No preprocessing is applied by the bridge —
+swipe/contact quality remains the dominant factor.

@@ -55,14 +55,44 @@ as fallback, but you should keep an hour for plan B: password always works).
   even at full coverage. Breathing on the fingertip fixed a 3/3 run here.
 - Verify prompts are event-driven: fprintd signals `finger-needed` over D-Bus,
   the bridge starts exactly one capture, and a repeat `VerifyStart` inside one
-  authentication re-delivers/retries. Swipes made before the sensor arms (~3 s)
-  are missed; the bridge retries up to 3 × 18 s inside one prompt.
+  authentication re-delivers/retries. HP's tool is ready in ~0.5 s (measured),
+  so there is nothing to wait for: start the swipe when the prompt appears, but
+  keep it slow. The bridge retries up to 3 × 18 s inside one prompt.
 - Repeated back-to-back captures can push the sensor into short/degraded scans and
   even trigger USB re-enumeration; the bridge waits 2.5 s before retrying.
 - libfprint's bozorth3 threshold is 40; genuine full-length slow swipes score
   65–122 here, partial scans (height 194–271) often score < 40. See
   `docs/FINDINGS.md` and the score/height correlation traces in the journal
   (`journalctl -u fprintd | grep score`, `journalctl -u vfs495-bridge`).
+- **One print = five sub-templates.** libfprint stores one template per enrollment
+  stage (five here) inside the single print file and the matcher tries them in
+  order, stopping at the first score ≥ 40. PAM calls `VerifyStart("any")`, so with
+  two or more prints enrolled fprintd *identifies* against all of them. That makes
+  extra templates a legitimate accuracy lever that does not touch the threshold.
+- **Optional second template for the same finger.** fprintd 1.94 refuses
+  re-enrolling a finger it can already identify (`enroll-duplicate`), but a print
+  can be built offline from archived scans that already score well:
+  ```bash
+  # 1. copy the enrolled print out (root) for offline scoring
+  sudo cp /var/lib/fprint/$USER/virtual_image/0/7 /tmp/enrolled.print
+  # 2. score archived scans ~/.local/share/vfs495/scans/*.pgm (or /run/vfs495-fprint/scans)
+  python3 tools/vfs495_score_image.py /tmp/enrolled.print /run/vfs495-fprint/scans/*.pgm
+  # 3. build an extra print from the five best scans (same physical finger!)
+  VFS495_PRINT_FINGER=RIGHT_MIDDLE VFS495_PRINT_USER=$USER \
+      python3 tools/vfs495_build_print.py /tmp/extra.print <five-good-scans...>
+  # 4. install it as a second gallery print (additive; original stays untouched)
+  sudo install -o root -g root -m 644 /tmp/extra.print \
+      /var/lib/fprint/$USER/virtual_image/0/8 && sudo restorecon /var/lib/fprint/$USER/virtual_image/0/8
+  ```
+  Measured on held-out scans: 39/40 → 42/40 and 23/40 → 56/40 (MATCH), while
+  genuinely bad swipes stayed bad (17/40, 6/40). The extra print appears in
+  `fprintd-verify`'s list as a second finger (`right-middle-finger` here) because
+  the filename must match the print's finger metadata; it is the same physical
+  finger. Remove it with `sudo rm /var/lib/fprint/$USER/virtual_image/0/8`.
+- **Image preprocessing does not help.** CLAHE, percentile stretch, gamma,
+  unsharp and morphological variants of six archived scans moved scores by
+  -8…+11 with no consistent sign; only one of four failing scans crossed 40 and
+  others regressed. Nothing of the sort is applied by the bridge.
 - "Stuck state": after many rapid captures the sensor returns tiny scans
   (height < 180, e.g. 200x12/200x15). `MIN_ROWS=180` in the bridge rejects those
   and retries twice. Only a **full power-off** clears the stuck sensor; warm

@@ -141,6 +141,16 @@ fprintd (NBIS minutiae + bozorth3)  →  enroll / verify  →  PAM (login, sudo,
   scored 3–39 and never matched. Press the whole pad flat (not just the tip) and use even pressure.
   Dry skin lowers ridge contrast dramatically: breathing on the fingertip fixed a 3/3 run here.
   When a swipe is rejected as `partial contact`, the prompt is still open — swipe again.
+- **How matching works (and how to get more accuracy without lowering the threshold).**
+  One enrolled print holds five sub-templates (one per enrollment stage) and the matcher
+  stops at the first score ≥ 40. PAM asks fprintd to verify `any`, so if a second print is
+  enrolled fprintd identifies against both. fprintd 1.94 refuses to re-enroll a finger it
+  can identify (`enroll-duplicate`), but an extra print can be built offline from scans
+  that already score well: `tools/vfs495_score_image.py` scores archived scans (no root,
+  no swipes) and `tools/vfs495_build_print.py` builds the print. Measured gain on
+  held-out swipes: 39/40 → 42/40 and 23/40 → 56/40, with the threshold untouched. Steps
+  and caveats in [`packaging/fedora/README.md`](packaging/fedora/README.md) and
+  [`docs/FINDINGS.md`](docs/FINDINGS.md).
 - **See what happened.** `sudo journalctl -u vfs495-bridge -f` shows *finger needed → swipe now*,
   *delivered scan*, or *no finger captured*. `sudo journalctl -u fprintd | grep score` shows the
   matcher's score for every swipe (**≥ 40 = match**).
