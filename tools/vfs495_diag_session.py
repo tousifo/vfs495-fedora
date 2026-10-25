@@ -141,8 +141,8 @@ def run_round(finger, round_no, total, round_timeout=ROUND_TIMEOUT):
         print("  [verify] " + line, flush=True)
         if not armed and "Verify started" in line:
             armed = True
-            notify("SWIPE NOW", f"{finger}: wait ~3 s, then one slow full-length swipe")
-            print("  >>> SWIPE NOW: wait ~3 s, then one slow full-length swipe", flush=True)
+            notify("SWIPE NOW", f"{finger}: swipe now — slow and full-length")
+            print("  >>> SWIPE NOW: swipe now — slow and full-length", flush=True)
     p.wait()
     scores, dims, msgs = analyze_round(since)
     stats = ""
