@@ -13,6 +13,7 @@ CAPTURE = "/home/tousifo/vfs495-linux/tools/vfs495_capture_asm.py"
 MIN_ROWS = 180                                # a real swipe assembles to ~200x300; tiny = no usable print
 MAX_STD = 85                                # extreme only: real swipes measured 34-80, broken frame 91/99
 MAX_SAT = 25                                # % of pixels at the extremes (saturated) — healthy <7%
+MIN_COVER = 40                              # % of frame covered by the print; hopeless partials measured ~30%
 RUN = "/run/vfs495-fprint"                  # tmpfs, root only; last.pgm = most recent capture (debugging)
 SCAN_DIR = RUN + "/scans"                   # archive of delivered scans (for matched/unmatched analysis)
 BUS_NAME, DEV_IFACE = "net.reactivated.Fprint", "net.reactivated.Fprint.Device"
@@ -38,13 +39,16 @@ def image_stats(w, h, data):
         import numpy as np
         a = np.frombuffer(data[:w * h], dtype=np.uint8)
         if a.size != w * h:
-            return "", None, None
+            return "", None, None, None
         sat = float(((a <= 2) | (a >= 253)).mean() * 100)
+        # contact coverage: share of the frame that differs from the flat background.
+        # Failing swipes measured 30-67 %, matching swipes 75-84 %.
+        cover = float((np.abs(a.astype(np.int16) - int(np.median(a))) > 12).mean() * 100)
         txt = (f"mean={a.mean():.0f} std={a.std():.0f} "
-               f"dark={(a < 128).mean() * 100:.1f}% sat={sat:.1f}%")
-        return txt, float(a.std()), sat
+               f"dark={(a < 128).mean() * 100:.1f}% sat={sat:.1f}% cover={cover:.0f}%")
+        return txt, float(a.std()), sat, cover
     except Exception:
-        return "", None, None
+        return "", None, None, None
 
 _image_socket = None
 
@@ -122,11 +126,13 @@ def capture_and_deliver(gen):
                 log("capture cancelled (fprintd no longer waiting)"); return
             if ok:
                 img = read_pgm(out); os.replace(out, last)
-                stats, std, sat = image_stats(*img)
+                stats, std, sat, cover = image_stats(*img)
                 reason = None
                 if img[1] < MIN_ROWS:
                     reason = (f"{img[0]}x{img[1]} is too short — swipe too short/fast, or the sensor is in "
                               "its stuck state (then: full power-off, not a reboot)")
+                elif cover is not None and cover < MIN_COVER:
+                    reason = f"partial contact ({cover:.0f}% of frame covered — press the whole finger flat)"
                 elif std is not None and std > MAX_STD:
                     reason = f"degenerate frame (std {std:.0f})"
                 elif sat is not None and sat > MAX_SAT:

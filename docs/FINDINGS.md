@@ -387,3 +387,17 @@ env var (libfprint/drivers/virtual-image.c class_init).
 Related captured-frame quality evidence: healthy 200x(180-300) scans have
 std 28-54, saturated pixels <6%; broken half-frames have std 90+ / 25-50% sat and
 score 3-20. Bridge gate: height >=180, std <=85, sat <=25%. Real swipes measured std 34-80.
+
+## Swipe contact quality dominates match success (2026-10-25, measured)
+Ten delivered scans correlated against their bozorth3 scores:
+- contact coverage 75-84% of frame -> matched every time (scores 49, 80, 81, 98, 98)
+- coverage 61-67% -> always failed (max scores 7-23)
+- coverage 52% -> 39/40 (one point short)
+- coverage 30% (std 11) -> scores 6
+Coverage = share of pixels differing from the flat background by >12 levels. Rows alone
+do not predict success (a 300-row scan at 61% coverage still failed). Technique that
+works on this sensor: place the whole finger pad flat on the sensor, wait ~3 s after
+the prompt (the gdb capture tool needs ~2 s to attach), then one slow full-length
+swipe with even pressure. Bridge gate now rejects only hopeless partials (cover <40%),
+so a merely imperfect swipe is still delivered and may match; retries stay enabled
+within the same auth request.
