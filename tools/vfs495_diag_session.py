@@ -33,9 +33,20 @@ def now_iso():
     return fmt_iso(datetime.now())
 
 
-def journal_since(since, unit):
-    return subprocess.run(["journalctl", "-u", unit, "--since=" + since, "-O", "short-iso"],
+def journal_since(since):
+    """Full journal since a timestamp. NOTE: after some reboots journald's -u unit
+    filter misses fprintd entries; filtering by text is reliable on this machine."""
+    return subprocess.run(["journalctl", "--since=" + since, "--no-pager", "-o", "short-iso"],
                           capture_output=True, text=True, check=False).stdout
+
+
+def analyze_round(since):
+    j = journal_since(since)
+    scores = re.findall(r"score (\d+)/(\d+)", j)
+    br = "\n".join(l for l in j.splitlines() if "vfs495-bridge" in l)
+    dims = re.findall(r"delivered scan (\d+)x(\d+) after ([\d.]+)s", br)
+    msgs = re.findall(r"\[vfs495-bridge\] (.*)", br)
+    return scores, dims, msgs
 
 
 def enrolled_fingers(dev_path="/net/reactivated/Fprint/Device/0", user=None):
@@ -47,14 +58,6 @@ def enrolled_fingers(dev_path="/net/reactivated/Fprint/Device/0", user=None):
     user = user or os.environ.get("SUDO_USER") or __import__("getpass").getuser()
     return [str(x) for x in dbus.Interface(o, "net.reactivated.Fprint.Device")
             .ListEnrolledFingers(user)], user
-
-
-def analyze_round(since):
-    scores = re.findall(r"score (\d+)/(\d+)", journal_since(since, "fprintd.service"))
-    br = journal_since(since, "vfs495-bridge.service")
-    dims = re.findall(r"delivered scan (\d+)x(\d+) after ([\d.]+)s", br)
-    msgs = re.findall(r"\[vfs495-bridge\] (.*)", br)
-    return scores, dims, msgs
 
 
 def run_round(finger, round_no, total):

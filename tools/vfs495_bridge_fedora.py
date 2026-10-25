@@ -14,6 +14,8 @@ MIN_ROWS = 180                                # a real swipe assembles to ~200x3
 RUN = "/run/vfs495-fprint"                  # tmpfs, root only; last.pgm = most recent capture (debugging)
 BUS_NAME, DEV_IFACE = "net.reactivated.Fprint", "net.reactivated.Fprint.Device"
 PROPS = "org.freedesktop.DBus.Properties"
+CAPTURE_PAUSE = 1.5                         # kept for documentation; applied only between retries
+RETRY_PAUSE = 2.5                           # wait before retrying after a tiny/failed scan
 lock = threading.Lock()
 state = {"proc": None, "capturing": False, "wanted": False, "gen": 0}
 
@@ -23,6 +25,18 @@ def read_pgm(p):
     with open(p, "rb") as f:
         assert f.readline().strip() == b"P5"; w, h = map(int, f.readline().split()); f.readline()
         return w, h, f.read(w * h)
+
+
+def image_stats(w, h, data):
+    """Compact quality metrics logged with every delivered scan (no image data itself)."""
+    try:
+        import numpy as np
+        a = np.frombuffer(data[:w * h], dtype=np.uint8)
+        if a.size != w * h:
+            return ""
+        return f"mean={a.mean():.0f} std={a.std():.0f} dark={(a < 128).mean() * 100:.1f}%"
+    except Exception:
+        return ""
 
 _image_socket = None
 
@@ -72,6 +86,10 @@ def capture_and_deliver(gen):
     t0 = time.monotonic()
     try:
         for attempt in range(2):                       # a swipe can straddle the window; try twice
+            if attempt > 0:
+                # recovery pause between captures: rapid back-to-back captures make the
+                # sensor return tiny/degraded scans and trigger its own USB reset behaviour
+                time.sleep(RETRY_PAUSE)
             ok = run_capture(out)
             if state["gen"] != gen or not state["wanted"]:
                 log("capture cancelled (fprintd no longer waiting)"); return
@@ -82,10 +100,11 @@ def capture_and_deliver(gen):
                         "its stuck state (then: full power-off, not a reboot)"); ok = False
                 else:
                     try:
-                        deliver(*img); log(f"delivered scan {img[0]}x{img[1]} after {time.monotonic()-t0:.1f}s"); return
+                        deliver(*img); log(f"delivered scan {img[0]}x{img[1]} {image_stats(*img)} after {time.monotonic()-t0:.1f}s"); return
                     except OSError as e:
                         log(f"deliver failed: {e}"); return
-            if not ok: log("no usable finger scan" + (", retrying" if attempt == 0 else " (give up)"))
+            if not ok:
+                log("no usable finger scan" + (", retrying" if attempt == 0 else " (give up)"))
     finally:
         try: os.unlink(out)
         except OSError: pass
