@@ -131,11 +131,11 @@ fprintd (NBIS minutiae + bozorth3)  →  enroll / verify  →  PAM (login, sudo,
 
 ## Troubleshooting
 
-- **Swipe timing.** When a prompt appears (login, `sudo`, `fprintd-enroll`), the sensor needs about
-  3 seconds to arm (HP's binary is started and initialises the secure session). **Wait a moment,
-  then swipe slowly**, whole finger pad flat on the sensor, one steady full‑length motion. A swipe
-  made instantly after the prompt is usually missed; just swipe again — the bridge makes up to
-  three 18‑second capture attempts inside one prompt.
+- **Swipe timing.** HP's tool reaches its "waiting for a finger" state in about 0.5 s, so there is
+  nothing to wait for: **start your swipe as the prompt appears**, but keep it **slow and steady**,
+  whole finger pad flat, one full‑length motion. Rushing is the main cause of low scores.
+  If a swipe is missed or rejected, just swipe again — the bridge makes up to three 18‑second
+  capture attempts inside one prompt.
 - **Contact is everything on this sensor.** The bridge logs `cover=NN%` for every scan. Swipes
   covering ≥ 60 % of the frame matched in every measured case (scores 40–122); below ~60 % they
   scored 3–39 and never matched. Press the whole pad flat (not just the tip) and use even pressure.
