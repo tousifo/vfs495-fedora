@@ -19,6 +19,8 @@ BUS_NAME, DEV_IFACE = "net.reactivated.Fprint", "net.reactivated.Fprint.Device"
 PROPS = "org.freedesktop.DBus.Properties"
 CAPTURE_PAUSE = 1.5                         # kept for documentation; applied only between retries
 RETRY_PAUSE = 2.5                           # wait before retrying after a tiny/failed scan
+CAPTURE_TIMEOUT = 18                        # seconds per attempt: a real swipe lands within ~2-10 s
+MAX_ATTEMPTS = 3                            # retries within one auth request (~60 s total)
 lock = threading.Lock()
 state = {"proc": None, "capturing": False, "wanted": False, "gen": 0}
 
@@ -72,7 +74,7 @@ def deliver(w, h, data):
 
 def run_capture(out):
     """One capture attempt. Returns True if an image was written to `out`."""
-    p = subprocess.Popen([sys.executable, CAPTURE, out], env={**os.environ, "VFS_TIMEOUT": "70"},
+    p = subprocess.Popen([sys.executable, CAPTURE, out], env={**os.environ, "VFS_TIMEOUT": str(CAPTURE_TIMEOUT)},
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     with lock: state["proc"] = p
     rc = p.wait()
@@ -107,11 +109,14 @@ def capture_and_deliver(gen):
     out, last = RUN + "/cap.pgm", RUN + "/last.pgm"
     t0 = time.monotonic()
     try:
-        for attempt in range(2):                       # a swipe can straddle the window; try twice
+        for attempt in range(MAX_ATTEMPTS):            # retry within one auth request (missed/partial swipe)
             if attempt > 0:
                 # recovery pause between captures: rapid back-to-back captures make the
                 # sensor return tiny/degraded scans and trigger its own USB reset behaviour
+                if state["gen"] != gen or not state["wanted"]:
+                    log("capture cancelled (fprintd no longer waiting)"); return
                 time.sleep(RETRY_PAUSE)
+                log("retrying capture — swipe again if the finger prompt is still showing")
             ok = run_capture(out)
             if state["gen"] != gen or not state["wanted"]:
                 log("capture cancelled (fprintd no longer waiting)"); return
@@ -135,7 +140,8 @@ def capture_and_deliver(gen):
                     except OSError as e:
                         log(f"deliver failed: {e}"); return
             if not ok:
-                log("no usable finger scan" + (", retrying" if attempt == 0 else " (give up)"))
+                last_attempt = attempt + 1 == MAX_ATTEMPTS
+                log("no usable finger scan" + (" (give up)" if last_attempt else ", retrying"))
     finally:
         try: os.unlink(out)
         except OSError: pass
