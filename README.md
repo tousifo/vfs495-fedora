@@ -8,7 +8,7 @@ This project reverse‑engineers the sensor and provides a **working end‑to‑
 image assembly → enrollment → verification, wired into **fprintd + PAM** so you can unlock
 `sudo`, the login screen, and the lock screen with your fingerprint.
 
-> Status: **working.** Verified end-to-end on an HP EliteBook (Debian 13): enroll, `fprintd-verify`, `sudo` and login via the packaged `.deb`. Genuine finger vs. impostor match scores 79 vs 5
+> Status: **working.** Verified end-to-end on an HP EliteBook (Debian 13): enroll, `fprintd-verify`, `sudo` and login via the packaged `.deb` — and on an HP ProBook 645 G4 (Fedora 44) via `packaging/fedora/` (bridge systemd service + stock fprintd with libfprint's `virtual_image`). Genuine finger vs. impostor match scores 79 vs 5
 > (threshold 40). It is *not yet a native libfprint driver* — capture currently drives HP's
 > proprietary userspace binary under `gdb` (see [Limitations](#limitations)). A native driver is
 > the roadmap. Contributions welcome.
@@ -52,6 +52,11 @@ sudo -k && sudo true                            # test: swipe → fingerprint lo
 That's it — no tinkering. The package fetches HP's proprietary driver from HP's own server at install
 time (it is not redistributed), configures the capture service, fprintd, udev and PAM.
 Build it yourself: `packaging/build-deb.sh`.
+
+**Fedora** (no deb supported): `sudo bash packaging/fedora/install-fedora.sh`
+after installing the deps listed in [`packaging/fedora/README.md`](packaging/fedora/README.md)
+(same capture-harness setup from `runtime/README.md` is required once).
+Verified on Fedora 44 / fprintd 1.94.5 / HP ProBook 645 G4.
 
 ## Quick start (manual / development)
 
