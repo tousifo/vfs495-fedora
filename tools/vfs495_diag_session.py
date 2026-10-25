@@ -126,10 +126,12 @@ def run_round(finger, round_no, total, round_timeout=ROUND_TIMEOUT):
     stats = ""
     if dims:
         g = dims[-1]
-        w, h, captime = g[0], g[1], g[6]
+        w, h, captime = g[0], g[1], g[7]
         stats = f"mean={g[2]} std={g[3]} dark={g[4]}%" if g[2] else ""
         if g[5]:
             stats += f" sat={g[5]}%"
+        if g[6]:
+            stats += f" cover={g[6]}%"
     else:
         w = h = captime = "-"
     maxsc = max((int(s) for s, _ in scores), default=None)
