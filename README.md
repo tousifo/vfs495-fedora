@@ -1,5 +1,11 @@
 # VFS495 fingerprint reader on Linux (Validity `138a:003f`)
 
+**This repository is the Fedora-focused build** of the VFS495 work: fprintd enrollment,
+verification and PAM login through the `virtual_image` bridge, including the Fedora 44
+fixes (libfprint thermal-guard lockout, capture pacing, contact-quality gate) and the
+measurements behind them. The Debian packaging and original capture harness come from
+[saifulmd0/vfs495-linux](https://github.com/saifulmd0/vfs495-linux).
+
 **Working Linux fingerprint login for the Validity Sensors VFS495 (USB `138a:003f`)** — a
 swipe reader found in many 2013–2015 HP EliteBook / ProBook / ZBook laptops that
 [libfprint does not support](https://fprint.freedesktop.org/supported-devices.html).
@@ -51,7 +57,7 @@ then yes. This is the **Falcon**‑generation Validity swipe sensor (older than 
 ## Quick start (the easy way — one package)
 
 Download the latest `vfs495-fprint_*_amd64.deb` from the
-[Releases page](https://github.com/saifulmd0/vfs495-linux/releases), then:
+[upstream releases page](https://github.com/saifulmd0/vfs495-linux/releases), then:
 ```bash
 sudo apt install ./vfs495-fprint_*_amd64.deb   # pulls deps, downloads HP's driver from HP, sets up fprintd+PAM
 fprintd-enroll                                  # swipe the same finger slowly, full length, when prompted
