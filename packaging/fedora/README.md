@@ -45,9 +45,10 @@ as fallback, but you should keep an hour for plan B: password always works).
   Fix: `FP_VIRTUAL_IMAGE_HOT_SECONDS=-1` in the fprintd drop-in (upstream-documented
   env var; disables the model, "device can run continuously").
 - **Quality gate.** The bridge rejects frames whose height is < 180 rows or whose
-  pixel statistics are degenerate (std > 65 or > 25 % saturated pixels). Healthy
-  scans measure std 28–54 / < 6 % saturated; broken half-frames measure std 90+ /
-  25–50 %.
+  pixel statistics are clearly unusable (std > 85 or > 25 % saturated pixels).
+  Delivered real swipes measured std 34–80 / < 7 % saturated; the broken frame
+  measured std 91–99 / 25–50 %. The gate is deliberately conservative: rejecting a
+  good swipe costs an attempt, while delivering a bad one only costs one no-match.
 - Verify prompts are event-driven: fprintd signals `finger-needed` over D-Bus,
   the bridge starts exactly one capture, and a repeat `VerifyStart` inside one
   authentication re-delivers/retries. Swipes made before the sensor arms (~2 s)

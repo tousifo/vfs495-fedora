@@ -11,9 +11,10 @@ from gi.repository import GLib
 SOCK = os.environ.get("FP_VIRTUAL_IMAGE", "/run/fprint/virtimg_sock")
 CAPTURE = "/home/tousifo/vfs495-linux/tools/vfs495_capture_asm.py"
 MIN_ROWS = 180                                # a real swipe assembles to ~200x300; tiny = no usable print
-MAX_STD = 65                                # degenerate frames measured at std 91-99; healthy ones 28-54
-MAX_SAT = 25                                # % of pixels at the extremes (saturated) — healthy <6%
+MAX_STD = 85                                # extreme only: real swipes measured 34-80, broken frame 91/99
+MAX_SAT = 25                                # % of pixels at the extremes (saturated) — healthy <7%
 RUN = "/run/vfs495-fprint"                  # tmpfs, root only; last.pgm = most recent capture (debugging)
+SCAN_DIR = RUN + "/scans"                   # archive of delivered scans (for matched/unmatched analysis)
 BUS_NAME, DEV_IFACE = "net.reactivated.Fprint", "net.reactivated.Fprint.Device"
 PROPS = "org.freedesktop.DBus.Properties"
 CAPTURE_PAUSE = 1.5                         # kept for documentation; applied only between retries
@@ -85,6 +86,22 @@ def kill_capture():
         except OSError: pass
         subprocess.run(["pkill", "-9", "-f", "validity-sensor-unlocked"], stderr=subprocess.DEVNULL)
 
+def archive_scan(w, h, data, std, sat):
+    """Keep the last 40 delivered scans so matched and unmatched swipes can be compared later."""
+    try:
+        os.makedirs(SCAN_DIR, mode=0o700, exist_ok=True)
+        name = (f"{time.strftime('%Y%m%d-%H%M%S')}_{w}x{h}"
+                f"_std{0 if std is None else std:.0f}_sat{0 if sat is None else sat:.0f}.pgm")
+        with open(os.path.join(SCAN_DIR, name), "wb") as f:
+            f.write(b"P5\n%d %d\n255\n" % (w, h))
+            f.write(data[:w * h])
+        for old in sorted(os.listdir(SCAN_DIR))[:-40]:
+            try: os.unlink(os.path.join(SCAN_DIR, old))
+            except OSError: pass
+    except Exception as e:
+        log(f"archive failed: {e}")
+
+
 def capture_and_deliver(gen):
     os.makedirs(RUN, mode=0o700, exist_ok=True)
     out, last = RUN + "/cap.pgm", RUN + "/last.pgm"
@@ -112,6 +129,7 @@ def capture_and_deliver(gen):
                 if reason:
                     log(f"rejected scan {img[0]}x{img[1]}: {reason}"); ok = False
                 else:
+                    archive_scan(*img, std, sat)
                     try:
                         deliver(*img); log(f"delivered scan {img[0]}x{img[1]} {stats} after {time.monotonic()-t0:.1f}s"); return
                     except OSError as e:

@@ -386,4 +386,4 @@ Fix (config only, no rebuild): `FP_VIRTUAL_IMAGE_HOT_SECONDS=-1` in
 env var (libfprint/drivers/virtual-image.c class_init).
 Related captured-frame quality evidence: healthy 200x(180-300) scans have
 std 28-54, saturated pixels <6%; broken half-frames have std 90+ / 25-50% sat and
-score 3-20. Bridge gate: height >=180, std <=65, sat <=25%.
+score 3-20. Bridge gate: height >=180, std <=85, sat <=25%. Real swipes measured std 34-80.
