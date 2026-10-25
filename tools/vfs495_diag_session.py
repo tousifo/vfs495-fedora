@@ -1,82 +1,119 @@
 #!/usr/bin/env python3
-"""Reproducible intermittent-verify diagnosis for the VFS495 bridge (no root needed).
+"""Live intermittent-verify diagnosis for the VFS495 bridge (ordinary user, no root).
 
-Runs N fprintd-verify rounds while watching the D-Bus device state and the system
-journal, then correlates each delivered scan (dimensions, capture time) with the
-matcher's score batch. Prints a table + a verdict for each attempt and appends a
-CSV summary under /tmp/opencode (scores + dimensions only — no biometric images).
+For each requested finger it runs N fprintd-verify rounds, streaming live prompts
+from fprintd-verify and "swipe now / delivered scan" from both systemd units.
+After each round it correlates the last delivered scan (dimensions, capture time)
+with the matcher's score batch. Appends a score+dimension CSV (no image data).
 
-Usage (as the enrolled ordinary user):
-    python3 tools/vfs495_diag_session.py [N] [--finger right-index-finger]
+Usage:
+    python3 tools/vfs495_diag_session.py [N] [finger ...]
+    N                verify rounds per finger (default 3)
+    finger           enroled finger names; default = ALL enrolled fingers
 
-NOTE: for each attempt, wait ~2 s for the sensor to arm after the prompt, then
-swipe the SAME enrolled finger slowly, full length, one steady motion.
+Timing rule for good data: when the prompt says the sensor is armed (verify
+started), WAIT ~2 s, then swipe ONE steady full-length motion of the same finger.
 """
 import csv
+import os
 import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 
-LOCAL_TZ = datetime.now().astimezone().tzinfo
-FP_DEVICE_IFACE = "net.reactivated.Fprint.Device"
+RESULTS_CSV = "/tmp/opencode/vfs495_diag_sessions.csv"
 
-def now_micro():
-    return datetime.now(LOCAL_TZ)
-
-def journal(since, unit):
-    out = subprocess.run(["journalctl", "-u", unit, "--since=" + since, "-O", "short-iso"],
-                         capture_output=True, text=True, check=False).stdout
-    return out
-
-def highest_since(since):
-    f = journal(since, "fprintd.service")
-    scores = [(int(a), int(b)) for a, b in re.findall(r"score (\d+)/(\d+)", f)]
-    br = journal(since, "vfs495-bridge.service")
-    dims = [(int(x), int(y)) for x, y in re.findall(r"delivered scan (\d+)x(\d+)", br)]
-    msgs = [m for m in re.findall(r"\[vfs495-bridge\] (.*)", br)]
-    return scores, dims, msgs
 
 def fmt_iso(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
+
+def now_iso():
+    return fmt_iso(datetime.now())
+
+
+def journal_since(since, unit):
+    return subprocess.run(["journalctl", "-u", unit, "--since=" + since, "-O", "short-iso"],
+                          capture_output=True, text=True, check=False).stdout
+
+
+def enrolled_fingers(dev_path="/net/reactivated/Fprint/Device/0", user=None):
+    import dbus
+    from dbus.mainloop import glib
+    glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    o = bus.get_object("net.reactivated.Fprint", dev_path)
+    user = user or os.environ.get("SUDO_USER") or __import__("getpass").getuser()
+    return [str(x) for x in dbus.Interface(o, "net.reactivated.Fprint.Device")
+            .ListEnrolledFingers(user)], user
+
+
+def analyze_round(since):
+    scores = re.findall(r"score (\d+)/(\d+)", journal_since(since, "fprintd.service"))
+    br = journal_since(since, "vfs495-bridge.service")
+    dims = re.findall(r"delivered scan (\d+)x(\d+) after ([\d.]+)s", br)
+    msgs = re.findall(r"\[vfs495-bridge\] (.*)", br)
+    return scores, dims, msgs
+
+
+def run_round(finger, round_no, total):
+    print(f"\n───────── round {round_no}/{total}: {finger} ─────────")
+    print("  READY: verify starting — wait ~2 s after 'swipe now', then SWIPE SLOW & FULL")
+    t0 = datetime.now()
+    since = fmt_iso(t0)
+    p = subprocess.Popen(["fprintd-verify", "-f", finger],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    fprintd_out = []
+    try:
+        for line in p.stdout:
+            line = line.strip()
+            fprintd_out.append(line)
+            print("  [verify] " + line)
+    except Exception:
+        pass
+    p.wait()
+    scores, dims, msgs = analyze_round(since)
+    w, h, captime = dims[-1] if dims else ("-", "-", "-")
+    maxsc = max((int(s) for s, _ in scores), default=None)
+    verdict = ("MATCH" if maxsc is not None and maxsc >= 40 else
+               ("NO-MATCH" if scores else "NO-SCAN-DELIVERED"))
+    row = {"time": since, "finger": finger, "delivered_w": w, "delivered_h": h,
+           "capture_s": captime, "scores": ";".join(f"{s}/{t}" for s, t in scores),
+           "max_score": maxsc if maxsc is not None else -1, "verdict": verdict,
+           "verify_rc": p.returncode, "bridge_msgs": " | ".join(msgs[-4:])}
+    print(f"  → DELIVERED {w}x{h} in {captime}s | scores {row['scores'] or '(none)'} | {verdict}")
+    return row
+
+
 def main():
-    n = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 10
-    finger = sys.argv[sys.argv.index("--finger") + 1] if "--finger" in sys.argv else "right-index-finger"
+    args = sys.argv[1:]
+    n = int(args.pop(0)) if args and args[0].isdigit() else 3
+    fingers = args if args else None
+    if not fingers:
+        fingers, user = enrolled_fingers()
+        print(f"enrolled for {user}: {', '.join(fingers)}")
     rows = []
-    print(__doc__)
-    for i in range(1, n + 1):
-        t0 = now_micro()
-        since = fmt_iso(t0)
-        print(f"\n[{i}/{n}] starting verify at {since} — WAIT ~2 s, then SWIPE SLOW, FULL LENGTH")
-        p = subprocess.run(["fprintd-verify", "-f", finger], capture_output=True, text=True)
-        scores, dims, msgs = highest_since(since)
-        # take the last delivered scan and the score batch tied to it
-        got = dims[-1] if dims else ("-", "-")
-        maxsc = max((s for s, t in scores), default=None)
-        ok = maxsc is not None and maxsc >= 40
-        rows.append({"time": fmt_iso(t0),
-                     "delivered_w": got[0], "delivered_h": got[1],
-                     "scores": ";".join(str(s) + "/" + str(t) for s, t in scores),
-                     "max_score": maxsc if maxsc is not None else -1,
-                     "verdict": ("MATCH" if ok else ("NO-MATCH" if scores else "NO-SCAN-DELIVERED")),
-                     "cli_rc": p.returncode,
-                     "bridge_msgs": " | ".join(msgs)})
-        print(f"    delivered: {got[0]}x{got[1]}   scores: {rows[-1]['scores'] or '(none logged)'}   -> {rows[-1]['verdict']}")
-        if p.returncode != 0:
-            print(f"    fprintd-verify rc={p.returncode}: {p.stderr.strip()[:200]}")
-        time.sleep(1.5)
-    outcsv = "/tmp/opencode/vfs495_diag_sessions.csv"
-    with open(outcsv, "a", newline="") as f:
+    for finger in fingers:
+        for i in range(1, n + 1):
+            rows.append(run_round(finger, i, n))
+            time.sleep(2)          # let the sensor disarm before the next arm
+    os.makedirs(os.path.dirname(RESULTS_CSV), exist_ok=True)
+    new = not os.path.exists(RESULTS_CSV)
+    with open(RESULTS_CSV, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        if new:
+            w.writeheader()
         for r in rows:
             w.writerow(r)
-    good = [r for r in rows if r["verdict"] == "MATCH"]
-    print(f"\n==== summary: {len(good)}/{len(rows)} matches. CSV appended: {outcsv}")
-    hs = sorted(set(r["delivered_h"] for r in rows if r["delivered_h"] != "-"))
-    ms = max((r["max_score"] for r in rows), default=0)
-    print(f"delivered heights seen: {hs}   best score: {ms}/40")
+    print("\n════════ summary ════════")
+    for finger in fingers:
+        fr = [r for r in rows if r["finger"] == finger]
+        match = sum(r["verdict"] == "MATCH" for r in fr)
+        print(f"{finger:20} {match}/{len(fr)} matches | heights "
+              f"{[r['delivered_h'] for r in fr]} | best {max(r['max_score'] for r in fr)}/40")
+    print(f"CSV appended to {RESULTS_CSV}")
+
 
 if __name__ == "__main__":
     main()
