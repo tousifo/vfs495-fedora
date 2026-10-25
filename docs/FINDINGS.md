@@ -398,9 +398,9 @@ Coverage = share of pixels differing from the flat background by >12 levels. Row
 do not predict success (a 300-row scan at 61% coverage still failed). Technique that
 works on this sensor: place the whole finger pad flat on the sensor, wait ~3 s after
 the prompt (the gdb capture tool needs ~2 s to attach), then one slow full-length
-swipe with even pressure. Bridge gate now rejects only hopeless partials (cover <40%),
-so a merely imperfect swipe is still delivered and may match; retries stay enabled
-within the same auth request.
+swipe with even pressure. Bridge gate rejects anything below 60% contact, which was uniformly a wasted attempt
+in every measurement (best score 39/40); retries stay enabled within the same auth
+request and the diagnostics tool raises an immediate "swipe again" cue.
 
 Second controlled run (5 rounds, same finger, logs include cover=): match at coverage
 66/79/63%, failure at 51/56%. Combined with the first run, the practical threshold is

@@ -13,8 +13,9 @@ CAPTURE = "/home/tousifo/vfs495-linux/tools/vfs495_capture_asm.py"
 MIN_ROWS = 180                                # a real swipe assembles to ~200x300; tiny = no usable print
 MAX_STD = 85                                # extreme only: real swipes measured 34-80, broken frame 91/99
 MAX_SAT = 25                                # % of pixels at the extremes (saturated) — healthy <7%
-MIN_COVER = int(os.environ.get("VFS495_MIN_COVER", "40"))  # % of frame covered by the print;
-                                                            # override (e.g. 65) for enrollment
+MIN_COVER = int(os.environ.get("VFS495_MIN_COVER", "60"))  # % of frame covered by the print.
+                                                            # Calibrated: at >=61% matches occur,
+                                                            # at <=58% none did. Override for tuning.
 RUN = "/run/vfs495-fprint"                  # tmpfs, root only; last.pgm = most recent capture (debugging)
 SCAN_DIR = RUN + "/scans"                   # archive of delivered scans (for matched/unmatched analysis)
 BUS_NAME, DEV_IFACE = "net.reactivated.Fprint", "net.reactivated.Fprint.Device"

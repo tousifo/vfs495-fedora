@@ -47,6 +47,28 @@ def _pump(stream, q):
         q.put(None)
 
 
+def start_retry_watchdog():
+    """While a round is running, surface rejected/partial swipes immediately.
+
+    fprintd keeps the finger prompt open, so the user can simply swipe again; without
+    this cue an incomplete swipe just looks like nothing happened."""
+    def watch():
+        j = subprocess.Popen(["journalctl", "-f", "-o", "cat", "--since", now_iso()],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        last = 0.0
+        for line in j.stdout:
+            if "vfs495-bridge" not in line:
+                continue
+            if "rejected scan" in line or "retrying capture" in line:
+                if time.monotonic() - last < 2.0:
+                    continue
+                last = time.monotonic()
+                why = "press the whole finger flat" if "partial contact" in line else "swipe again"
+                notify("Swipe AGAIN", f"previous swipe not usable — {why}")
+                print("  >>> SWIPE AGAIN: previous swipe was unusable", flush=True)
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def fmt_iso(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -166,6 +188,7 @@ def main():
         fingers, user = enrolled_fingers()
         print(f"enrolled for {user}: {', '.join(fingers)}", flush=True)
     rows = []
+    start_retry_watchdog()
     for finger in fingers:
         for i in range(1, n + 1):
             rows.append(run_round(finger, i, n, round_timeout))
