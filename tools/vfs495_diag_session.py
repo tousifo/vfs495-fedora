@@ -44,7 +44,7 @@ def analyze_round(since):
     j = journal_since(since)
     scores = re.findall(r"score (\d+)/(\d+)", j)
     br = "\n".join(l for l in j.splitlines() if "vfs495-bridge" in l)
-    dims = re.findall(r"delivered scan (\d+)x(\d+) after ([\d.]+)s", br)
+    dims = re.findall(r"delivered scan (\d+)x(\d+) (?:mean=(\d+) std=(\d+) dark=([\d.]+)%)? ?after ([\d.]+)s", br)
     msgs = re.findall(r"\[vfs495-bridge\] (.*)", br)
     return scores, dims, msgs
 
@@ -77,20 +77,32 @@ def run_round(finger, round_no, total):
         pass
     p.wait()
     scores, dims, msgs = analyze_round(since)
-    w, h, captime = dims[-1] if dims else ("-", "-", "-")
+    stats = ""
+    if dims:
+        g = dims[-1]
+        w, h, captime = g[0], g[1], g[5]
+        stats = f"mean={g[2]} std={g[3]} dark={g[4]}%" if g[2] else ""
+    else:
+        w = h = captime = "-"
     maxsc = max((int(s) for s, _ in scores), default=None)
     verdict = ("MATCH" if maxsc is not None and maxsc >= 40 else
                ("NO-MATCH" if scores else "NO-SCAN-DELIVERED"))
     row = {"time": since, "finger": finger, "delivered_w": w, "delivered_h": h,
-           "capture_s": captime, "scores": ";".join(f"{s}/{t}" for s, t in scores),
+           "capture_s": captime, "image_stats": stats,
+           "scores": ";".join(f"{s}/{t}" for s, t in scores),
            "max_score": maxsc if maxsc is not None else -1, "verdict": verdict,
            "verify_rc": p.returncode, "bridge_msgs": " | ".join(msgs[-4:])}
-    print(f"  → DELIVERED {w}x{h} in {captime}s | scores {row['scores'] or '(none)'} | {verdict}")
+    print(f"  → DELIVERED {w}x{h} in {captime}s {stats} | scores {row['scores'] or '(none)'} | {verdict}")
     return row
 
 
 def main():
     args = sys.argv[1:]
+    gap = 4.0
+    if "--gap" in args:
+        i = args.index("--gap")
+        gap = float(args[i + 1])
+        del args[i:i + 2]
     n = int(args.pop(0)) if args and args[0].isdigit() else 3
     fingers = args if args else None
     if not fingers:
@@ -100,7 +112,7 @@ def main():
     for finger in fingers:
         for i in range(1, n + 1):
             rows.append(run_round(finger, i, n))
-            time.sleep(2)          # let the sensor disarm before the next arm
+            time.sleep(gap)          # let the sensor settle (burst captures degrade it)
     os.makedirs(os.path.dirname(RESULTS_CSV), exist_ok=True)
     new = not os.path.exists(RESULTS_CSV)
     with open(RESULTS_CSV, "a", newline="") as f:
