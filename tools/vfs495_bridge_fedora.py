@@ -11,6 +11,8 @@ from gi.repository import GLib
 SOCK = os.environ.get("FP_VIRTUAL_IMAGE", "/run/fprint/virtimg_sock")
 CAPTURE = "/home/tousifo/vfs495-linux/tools/vfs495_capture_asm.py"
 MIN_ROWS = 180                                # a real swipe assembles to ~200x300; tiny = no usable print
+MAX_STD = 65                                # degenerate frames measured at std 91-99; healthy ones 28-54
+MAX_SAT = 25                                # % of pixels at the extremes (saturated) — healthy <6%
 RUN = "/run/vfs495-fprint"                  # tmpfs, root only; last.pgm = most recent capture (debugging)
 BUS_NAME, DEV_IFACE = "net.reactivated.Fprint", "net.reactivated.Fprint.Device"
 PROPS = "org.freedesktop.DBus.Properties"
@@ -28,15 +30,18 @@ def read_pgm(p):
 
 
 def image_stats(w, h, data):
-    """Compact quality metrics logged with every delivered scan (no image data itself)."""
+    """Compact quality metrics used to gate delivery and logged with each scan."""
     try:
         import numpy as np
         a = np.frombuffer(data[:w * h], dtype=np.uint8)
         if a.size != w * h:
-            return ""
-        return f"mean={a.mean():.0f} std={a.std():.0f} dark={(a < 128).mean() * 100:.1f}%"
+            return "", None, None
+        sat = float(((a <= 2) | (a >= 253)).mean() * 100)
+        txt = (f"mean={a.mean():.0f} std={a.std():.0f} "
+               f"dark={(a < 128).mean() * 100:.1f}% sat={sat:.1f}%")
+        return txt, float(a.std()), sat
     except Exception:
-        return ""
+        return "", None, None
 
 _image_socket = None
 
@@ -95,12 +100,20 @@ def capture_and_deliver(gen):
                 log("capture cancelled (fprintd no longer waiting)"); return
             if ok:
                 img = read_pgm(out); os.replace(out, last)
+                stats, std, sat = image_stats(*img)
+                reason = None
                 if img[1] < MIN_ROWS:
-                    log(f"sensor returned a tiny scan ({img[0]}x{img[1]}): swipe too short/fast, or the sensor is in "
-                        "its stuck state (then: full power-off, not a reboot)"); ok = False
+                    reason = (f"{img[0]}x{img[1]} is too short — swipe too short/fast, or the sensor is in "
+                              "its stuck state (then: full power-off, not a reboot)")
+                elif std is not None and std > MAX_STD:
+                    reason = f"degenerate frame (std {std:.0f})"
+                elif sat is not None and sat > MAX_SAT:
+                    reason = f"saturated frame ({sat:.1f}%)"
+                if reason:
+                    log(f"rejected scan {img[0]}x{img[1]}: {reason}"); ok = False
                 else:
                     try:
-                        deliver(*img); log(f"delivered scan {img[0]}x{img[1]} {image_stats(*img)} after {time.monotonic()-t0:.1f}s"); return
+                        deliver(*img); log(f"delivered scan {img[0]}x{img[1]} {stats} after {time.monotonic()-t0:.1f}s"); return
                     except OSError as e:
                         log(f"deliver failed: {e}"); return
             if not ok:

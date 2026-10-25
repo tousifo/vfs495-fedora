@@ -37,15 +37,27 @@ as fallback, but you should keep an hour for plan B: password always works).
 
 ## How it works / quirks learned so far (Fedora-specific)
 
+- **Thermal guard (fixed).** libfprint's `virtual_image` debug driver simulates device
+  heating: the ratio rises while an auth session waits for a finger and, once >0.731,
+  every scan fails instantly with `Device disabled to prevent overheating`; it stays
+  HOT until the ratio decays below 0.5 (~3 min idle). That simulation is meaningless
+  for this pipeline and causes intermittent "fingerprint suddenly stopped working".
+  Fix: `FP_VIRTUAL_IMAGE_HOT_SECONDS=-1` in the fprintd drop-in (upstream-documented
+  env var; disables the model, "device can run continuously").
+- **Quality gate.** The bridge rejects frames whose height is < 180 rows or whose
+  pixel statistics are degenerate (std > 65 or > 25 % saturated pixels). Healthy
+  scans measure std 28–54 / < 6 % saturated; broken half-frames measure std 90+ /
+  25–50 %.
 - Verify prompts are event-driven: fprintd signals `finger-needed` over D-Bus,
   the bridge starts exactly one capture, and a repeat `VerifyStart` inside one
-  authentication re-delivers/retries.
+  authentication re-delivers/retries. Swipes made before the sensor arms (~2 s)
+  are missed; swipe again.
+- Repeated back-to-back captures can push the sensor into short/degraded scans and
+  even trigger USB re-enumeration; the bridge waits 2.5 s before retrying.
 - libfprint's bozorth3 threshold is 40; genuine full-length slow swipes score
   65–122 here, partial scans (height 194–271) often score < 40. See
   `docs/FINDINGS.md` and the score/height correlation traces in the journal
   (`journalctl -u fprintd | grep score`, `journalctl -u vfs495-bridge`).
-- Heat guard: after ~70 s armed the sensor refuses (`Device disabled to prevent
-  overheating`) until fprintd restarts. Do the enrollment swipes promptly.
 - "Stuck state": after many rapid captures the sensor returns tiny scans
   (height < 180, e.g. 200x12/200x15). `MIN_ROWS=180` in the bridge rejects those
   and retries twice. Only a **full power-off** clears the stuck sensor; warm

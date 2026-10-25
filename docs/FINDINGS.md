@@ -371,3 +371,19 @@ Feasibility is PROVEN: end-to-end plaintext fingerprint capture works on Debian 
 1. Is the .img decrypted on host (key in binary) before upload, or uploaded encrypted?
 2. Is the capture data path (irDliGetImage) AES-secured on VFS495, or only matching/auth patches?
 3. Minimal command sequence: device init -> patch upload? -> calibration -> capture.
+
+## Fedora 44 + virtual_image thermal guard (2026-10-25) — INTERMITTENT AUTH ROOT CAUSE
+Symptom: verification intermittently fails instantly (no scan window at all) with
+`Device reported an error during verify: Device disabled to prevent overheating.`
+libfprint's `fp-device-private.h` model: ratio += while an operation waits for a
+finger (180 s time constant), threshold HOT at 0.731, stays HOT until ratio < 0.5
+(9 min cold constant → ~3 min idle). On the virtual_image debug device this guard
+is meaningless (there is no real thermal sensor) but it fires during long PAM
+sessions (lock screen) and after bursts of test swipes.
+Fix (config only, no rebuild): `FP_VIRTUAL_IMAGE_HOT_SECONDS=-1` in
+`/etc/systemd/system/fprintd.service.d/virtimg.conf`; driver logs
+"Not updating temperature model, device can run continuously!". Upstream-supported
+env var (libfprint/drivers/virtual-image.c class_init).
+Related captured-frame quality evidence: healthy 200x(180-300) scans have
+std 28-54, saturated pixels <6%; broken half-frames have std 90+ / 25-50% sat and
+score 3-20. Bridge gate: height >=180, std <=65, sat <=25%.
