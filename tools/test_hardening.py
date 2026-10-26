@@ -263,6 +263,20 @@ class PrearmTest(unittest.TestCase):
         bridge.on_lock_changed(False)
         self.assertNotIn("kill", self.spawned)
 
+    def test_login1_locked_hint_drives_lock_state(self):
+        bridge.on_login1_props("net.reactivated.Fprint.Device", {"LockedHint": True}, None)
+        with bridge.lock:
+            self.assertFalse(bridge.state["locked"])      # wrong interface ignored
+        bridge.on_login1_props("org.freedesktop.login1.Session", {"finger-needed": True}, None)
+        with bridge.lock:
+            self.assertFalse(bridge.state["locked"])      # unrelated property ignored
+        bridge.on_login1_props("org.freedesktop.login1.Session", {"LockedHint": True}, None)
+        with bridge.lock:
+            self.assertTrue(bridge.state["locked"])
+        bridge.on_login1_props("org.freedesktop.login1.Session", {"LockedHint": False}, None)
+        with bridge.lock:
+            self.assertFalse(bridge.state["locked"])
+
     def test_maybe_prearm_gates(self):
         bridge.maybe_prearm()
         with bridge.lock:

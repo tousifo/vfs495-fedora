@@ -534,8 +534,10 @@ human reaction plus the swipe itself. The tool start and the capture wait are th
 serialised part — and both can happen *before* PAM asks.
 
 Design (all inside `tools/vfs495_bridge_fedora.py`, no new units):
-- The bridge follows `org.gnome.ScreenSaver.ActiveChanged` on every user session bus
-  (`/run/user/*/bus`, root may connect). On lock it starts ONE vendor session
+- The bridge follows the session lock via **logind `LockedHint`** (`PropertiesChanged`
+  on the system bus, set by mutter/gnome-shell on every lock and unlock) — root cannot
+  even `Hello()` on the user's dbus-broker session bus, so `org.gnome.ScreenSaver`
+  there is only followed best-effort. On lock it starts ONE vendor session
   immediately (mode `prearm`), bounded by `VFS495_PREARM_WINDOW` (45 s) with a polite
   teardown — the vendor tool's own default timeout is 75 s, so the bound stays well
   inside sensor-comfort territory. One pre-arm per lock period (`prearm_done`).

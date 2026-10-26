@@ -5,12 +5,14 @@ the real sensor and delivers the image to libfprint's virtual_image socket. When
 stops needing a finger (timeout, cancel, done) a still-running capture is cancelled, so the
 sensor is never held longer than an authentication actually lasts.
 
-Speed path (pre-arm): when the screen locks (org.gnome.ScreenSaver on the user session
-bus) the bridge starts ONE vendor session right away, so the tool is already armed when
-the user swipes at the lock screen. A good scan captured while fprintd is not asking yet
-is cached and handed over the instant finger-needed arrives, which takes the tool start
-(~0.5 s) and the capture wait out of the unlock. Pre-arm sessions are bounded
-(VFS495_PREARM_WINDOW, 45 s) and torn down politely; one pre-arm per lock period.
+Speed path (pre-arm): when the screen locks the bridge starts ONE vendor session right
+away, so the tool is already armed when the user swipes at the lock screen. A good scan
+captured while fprintd is not asking yet is cached and handed over the instant
+finger-needed arrives, which takes the tool start (~0.5 s) and the capture wait out of
+the unlock. The lock source is logind's LockedHint (set by mutter, visible on the system
+bus); org.gnome.ScreenSaver on user session buses is followed best-effort but dbus-broker
+refuses root there. Pre-arm sessions are bounded (VFS495_PREARM_WINDOW, 45 s) and torn
+down politely; one pre-arm per lock period.
 
 Sensor-health handling (post-suspend / after a hard kill):
   * cancellation is polite (SIGTERM -> the capture wrapper deinits the vendor tool itself);
@@ -341,13 +343,12 @@ def deliver_cached(img, gen):
 
 
 _lock_bus_paths = set()                     # user session buses we already follow
+_lock_bus_complained = set()
 
 def watch_screen_lock():
-    """Follow org.gnome.ScreenSaver on every user session bus (root may connect).
-
-    New/inactive sessions are picked up by the periodic refresh in main(); a lock that
-    already exists is noticed by a one-shot GetActive query after each connect.
-    """
+    """Best-effort follow of org.gnome.ScreenSaver on user session buses (secondary to
+    logind LockedHint — with dbus-broker, root cannot Hello() on a user session bus).
+    Failures are logged once per bus; the periodic refresh in main() retries."""
     added = 0
     for path in sorted(glob.glob("/run/user/*/bus")):
         if path in _lock_bus_paths:
@@ -358,7 +359,9 @@ def watch_screen_lock():
                                      dbus_interface="org.gnome.ScreenSaver",
                                      path="/org/gnome/ScreenSaver")
         except dbus.DBusException as e:
-            log(f"session bus {path}: connect failed ({e})")
+            if path not in _lock_bus_complained:
+                _lock_bus_complained.add(path)
+                log(f"session bus {path}: connect failed ({e}); using logind LockedHint instead")
             continue
         _lock_bus_paths.add(path)
         added += 1
@@ -561,7 +564,20 @@ VERIFY_STATUS_NAMES = {0: "match", 1: "no match", 100: "retry, scan again",
                        103: "remove finger and retry"}
 
 def on_verify_status(code, done, path=None):
-    log(f"verify result: {VERIFY_STATUS_NAMES.get(int(code), 'code ' + str(int(code)))} (done={bool(done)})")
+    if isinstance(code, str):                     # this fprintd sends strings: 'verify-match', ...
+        name = code.removeprefix("verify-").replace("-", " ")
+    else:
+        name = VERIFY_STATUS_NAMES.get(int(code), "code " + str(int(code)))
+    log(f"verify result: {name} (done={bool(done)})")
+
+LOGIN1_SESSION = "org.freedesktop.login1.Session"
+
+def on_login1_props(iface, changed, invalidated, path=None):
+    """logind LockedHint is set by mutter/gnome-shell on every lock and unlock. This is
+    the primary lock source: it is visible on the system bus (which we already use),
+    while root cannot even Hello() on the user's dbus-broker session bus."""
+    if iface != LOGIN1_SESSION or "LockedHint" not in changed: return
+    on_lock_changed(bool(changed["LockedHint"]))
 
 def _on_sigterm(signum, frame):
     raise SystemExit(0)
@@ -575,6 +591,8 @@ def main():
                             bus_name=BUS_NAME, path_keyword="path")
     bus.add_signal_receiver(on_verify_status, signal_name="VerifyStatus", dbus_interface=DEV_IFACE,
                             bus_name=BUS_NAME, path_keyword="path")
+    bus.add_signal_receiver(on_login1_props, signal_name="PropertiesChanged", dbus_interface=PROPS,
+                            bus_name="org.freedesktop.login1", path_keyword="path")
     def check_initial():                                # a scan already pending at startup?
         try:
             mgr = dbus.Interface(bus.get_object(BUS_NAME, "/net/reactivated/Fprint/Manager"), "net.reactivated.Fprint.Manager")
@@ -583,11 +601,25 @@ def main():
                 if bool(p.Get(DEV_IFACE, "finger-needed")): on_needed("pending at startup")
         except dbus.DBusException: pass
         return False
+    def check_initial_locked():                         # started while the screen is locked?
+        try:
+            mgr = dbus.Interface(bus.get_object("org.freedesktop.login1", "/org/freedesktop/login1"),
+                                 "org.freedesktop.login1.Manager")
+            for sess in mgr.ListSessions():             # tuples are wider than documented
+                path = sess[1]
+                p = dbus.Interface(bus.get_object("org.freedesktop.login1", path), PROPS)
+                if bool(p.Get(LOGIN1_SESSION, "LockedHint")) and bool(p.Get(LOGIN1_SESSION, "Active")):
+                    on_lock_changed(True, initial=True)
+                    break
+        except Exception:                               # a GLib callback must never crash the loop
+            pass
+        return False
     def refresh_lock_watch():                           # new sessions / re-login
         watch_screen_lock()
         return True
     signal.signal(signal.SIGTERM, _on_sigterm)
     GLib.timeout_add(1500, check_initial)
+    GLib.timeout_add(800, check_initial_locked)
     watch_screen_lock()
     GLib.timeout_add_seconds(120, refresh_lock_watch)
     log("idle; waiting for fprintd to need a finger")
