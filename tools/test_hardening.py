@@ -148,5 +148,164 @@ class HardeningTest(unittest.TestCase):
             self.assertNotIn("/", dev)
 
 
+class PrearmTest(unittest.TestCase):
+    """Pre-arm on screen lock: cache a good scan while locked, hand it to fprintd on
+    finger-needed. Everything is stubbed — no sensor, no root, no D-Bus."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vfs495-prearm-")
+        self.keep = {k: getattr(bridge, k) for k in
+                     ("RUN", "SCAN_DIR", "deliver", "run_capture", "capture_worker",
+                      "deliver_cached", "kill_capture", "PREARM_WINDOW", "RETRY_PAUSE")}
+        bridge.RUN = self.tmp
+        bridge.SCAN_DIR = os.path.join(self.tmp, "scans")
+        self.delivered = []
+        self.spawned = []                       # what a stubbed worker/killer received
+        self.captures = 0
+        self.real_worker = bridge.capture_worker        # stubs below must not hide these
+        self.real_deliver_cached = bridge.deliver_cached
+        bridge.deliver = lambda *a: self.delivered.append(a)
+        bridge.run_capture = self.fake_run_capture
+        bridge.capture_worker = lambda gen: self.spawned.append(("worker", gen))
+        bridge.deliver_cached = lambda img, gen: self.spawned.append(("cache", img, gen))
+        bridge.kill_capture = lambda: self.spawned.append("kill") or False
+        self.reset_state()
+
+    def tearDown(self):
+        for k, v in self.keep.items():
+            setattr(bridge, k, v)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.reset_state()
+
+    def reset_state(self):
+        with bridge.lock:
+            bridge.state.update(proc=None, capturing=False, wanted=False, gen=0,
+                                deferred=False, needs_reinit=False, locked=False,
+                                cache=None, mode=None, prearm_done=False)
+
+    def fake_run_capture(self, out, timeout=None):
+        """A healthy synthetic frame: 40 px flat background + 160 px strong texture per row
+        (cover 80 %, std ~20, no saturation — passes every gate)."""
+        self.captures += 1
+        row = bytes([128]) * 40 + bytes([100, 150]) * 80
+        with open(out, "wb") as f:
+            f.write(b"P5\n200 300\n255\n")
+            f.write(row * 300)
+        return 0
+
+    def good_img(self):
+        return 200, 300, bytes(200 * 300)
+
+    def test_cache_take_is_single_consumer_and_freshness_gated(self):
+        self.assertIsNone(bridge.cache_take())
+        bridge.cache_store(*self.good_img())
+        got = bridge.cache_take()
+        self.assertIsNotNone(got)
+        self.assertIsNone(bridge.cache_take())          # popped: exactly one consumer
+        with bridge.lock:
+            bridge.state["cache"] = (200, 300, b"x", time.monotonic() - 999)
+        self.assertIsNone(bridge.cache_take())          # stale -> dropped
+
+    def test_prearm_worker_caches_good_scan_instead_of_delivering(self):
+        with bridge.lock:
+            bridge.state.update(mode="prearm", locked=True, capturing=True)
+        self.real_worker(0)
+        with bridge.lock:
+            self.assertIsNotNone(bridge.state["cache"])
+            self.assertFalse(bridge.state["capturing"])
+            self.assertIsNone(bridge.state["mode"])
+            self.assertTrue(bridge.state["prearm_done"])  # one pre-arm per lock period
+        self.assertEqual(self.delivered, [])              # nothing sent to fprintd
+
+    def test_auth_worker_delivers_directly(self):
+        with bridge.lock:
+            bridge.state.update(mode="auth", wanted=True, capturing=True)
+        self.real_worker(0)
+        self.assertEqual(len(self.delivered), 1)
+        with bridge.lock:
+            self.assertIsNone(bridge.state["cache"])
+
+    def test_on_needed_hands_fresh_cache_to_fprintd(self):
+        bridge.cache_store(*self.good_img())
+        bridge.on_needed("test")
+        self.assertEqual([s[0] for s in self.spawned], ["cache"])
+        with bridge.lock:
+            self.assertIsNone(bridge.state["cache"])      # consumed
+
+    def test_on_needed_falls_back_to_capture_on_stale_cache(self):
+        with bridge.lock:
+            bridge.state["cache"] = (200, 300, b"x", time.monotonic() - 999)
+        bridge.on_needed("test")
+        self.assertEqual([s[0] for s in self.spawned], ["worker"])
+
+    def test_on_not_needed_keeps_prearm_but_kills_auth(self):
+        with bridge.lock:
+            bridge.state.update(mode="prearm", capturing=True, wanted=True)
+        bridge.on_not_needed()
+        self.assertNotIn("kill", self.spawned)
+        with bridge.lock:
+            bridge.state.update(mode="auth", capturing=True, wanted=True)
+        bridge.on_not_needed()
+        self.assertIn("kill", self.spawned)
+
+    def test_unlock_stops_prearm_and_clears_cache_but_spares_auth(self):
+        bridge.cache_store(*self.good_img())
+        with bridge.lock:
+            bridge.state.update(mode="prearm", capturing=True, locked=True)
+        bridge.on_lock_changed(False)
+        self.assertIn("kill", self.spawned)
+        with bridge.lock:
+            self.assertIsNone(bridge.state["cache"])
+            self.assertFalse(bridge.state["locked"])
+        self.spawned.clear()
+        with bridge.lock:
+            bridge.state.update(mode="auth", capturing=True, locked=True)
+        bridge.on_lock_changed(False)
+        self.assertNotIn("kill", self.spawned)
+
+    def test_maybe_prearm_gates(self):
+        bridge.maybe_prearm()
+        with bridge.lock:
+            self.assertEqual(bridge.state["mode"], "prearm")
+            self.assertTrue(bridge.state["capturing"])
+        time.sleep(0.1)                               # the worker thread runs the stub
+        self.assertEqual(self.spawned, [("worker", 1)])
+
+        self.reset_state()
+        with bridge.lock:
+            bridge.state["wanted"] = True                 # fprintd already asking -> no pre-arm
+        bridge.maybe_prearm()
+        with bridge.lock:
+            self.assertFalse(bridge.state["capturing"])
+
+        self.reset_state()
+        with bridge.lock:
+            bridge.state["prearm_done"] = True            # already pre-armed this lock period
+        bridge.maybe_prearm()
+        with bridge.lock:
+            self.assertFalse(bridge.state["capturing"])
+
+    def test_prearm_window_expires_before_any_capture(self):
+        bridge.PREARM_WINDOW = -1.0                       # expired the moment it starts
+        with bridge.lock:
+            bridge.state.update(mode="prearm", locked=True, capturing=True)
+        self.real_worker(0)
+        self.assertEqual(self.captures, 0)
+        with bridge.lock:
+            self.assertFalse(bridge.state["capturing"])
+
+    def test_deliver_cached_failure_falls_back_to_capture(self):
+        def boom(*a):
+            raise OSError("socket gone")
+        bridge.deliver = boom
+        with bridge.lock:
+            bridge.state.update(mode="auth", capturing=True)
+        self.real_deliver_cached(self.good_img() + (time.monotonic(),), 0)
+        self.assertEqual([s[0] for s in self.spawned], ["worker"])
+        with bridge.lock:
+            self.assertEqual(bridge.state["mode"], "auth")
+            self.assertTrue(bridge.state["capturing"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

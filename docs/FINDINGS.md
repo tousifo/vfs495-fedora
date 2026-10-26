@@ -526,3 +526,45 @@ down, or the resume itself) hit the same wedged state.
 - The "stuck sensor" advice stands: a *wedged* sensor (zero frames at all) still
   needs a full power-off — the hardening prevents getting there, it cannot heal
   an already-wedged sensor.
+
+## Pre-arm on screen lock (2026-10-27) — cut ~1.5–2.5 s off every unlock
+Measured auth cost (clean single swipe): 4.5–5.0 s, of which ~2 s is fixed pipeline
+cost (tool start ~0.5 s, assembly+delivery ~1 s, fprintd match ~0.3 s); the rest is
+human reaction plus the swipe itself. The tool start and the capture wait are the
+serialised part — and both can happen *before* PAM asks.
+
+Design (all inside `tools/vfs495_bridge_fedora.py`, no new units):
+- The bridge follows `org.gnome.ScreenSaver.ActiveChanged` on every user session bus
+  (`/run/user/*/bus`, root may connect). On lock it starts ONE vendor session
+  immediately (mode `prearm`), bounded by `VFS495_PREARM_WINDOW` (45 s) with a polite
+  teardown — the vendor tool's own default timeout is 75 s, so the bound stays well
+  inside sensor-comfort territory. One pre-arm per lock period (`prearm_done`).
+- A good scan captured while fprintd is not asking yet is cached (in memory, with a
+  timestamp) instead of delivered. When `finger-needed` arrives, the cache is handed
+  over immediately (`VFS495_PREARM_FRESH`, 20 s) — the unlock swipe is already
+  assembled, so PAM sees the image in milliseconds.
+- If fprintd asks *first* (common: GNOME starts the verify as soon as the lock screen
+  shows), the already-armed pre-arm session simply serves that auth directly — no
+  second vendor session is ever started (two sessions on one reader is the classic
+  wedge). The same worker switches semantics the moment `wanted` becomes true.
+- fprintd `not_needed` no longer kills a `prearm` worker (the screen is still locked);
+  an unlock (or the window expiring) tears it down via the usual polite path.
+- fprintd `VerifyStatus` is now logged (match/no-match/retry codes) so unlock latency
+  can be measured end-to-end from the journal.
+- Fallbacks: no session bus / no gnome-shell / pre-arm window expired / cache stale →
+  exactly the old behaviour. A cache-delivery failure falls back to a normal capture.
+
+Unit-tested in `tools/test_hardening.py` (`PrearmTest`, 10 tests, no sensor/root).
+**Live latency measurement: pending** — the journal now shows lock → pre-arm →
+swipe → delivery → match timestamps for this.
+
+## Ops: polkit + systemd-run on Fedora (2026-10-27) — the 25 s trap
+`org.freedesktop.systemd1.manage-units` defaults to `auth_admin_keep` in an active
+session: one interactive authentication, remembered ~5 minutes. Root work driven
+through `systemd-run --uid=0` therefore works silently *only* inside that window;
+once it lapses, every call pops an auth dialog and the D-Bus method call times out
+after 25 s — long before the agent's PAM fallback (fingerprint-first on this machine,
+~40 s) gives up. For unattended sessions, install a rule like
+`/etc/polkit-1/rules.d/45-manage-units-wheel.rules` granting `YES` on
+`manage-units` for local active wheel users, or re-authenticate right before a root
+step. `pkexec`/`sudo` remain unusable inside ZCode (NoNewPrivs).

@@ -49,6 +49,12 @@ then yes. This is the **Falcon**‑generation Validity swipe sensor (older than 
   Measured on this machine: swipes covering ≥ 60 % of the sensor frame matched every time
   (scores 40–122); swipes with less contact never did. With a slightly moist fingertip and
   full‑pad contact, 3/3 consecutive verifies matched.
+- ⚡ **Pre‑arm on screen lock (2026-10-27):** when the screen locks, the Fedora bridge starts
+  one capture session right away, so your unlock swipe is already assembled by the time PAM
+  asks — a fresh scan is handed to fprintd in milliseconds instead of after the ~2 s tool
+  start + capture pipeline. Bounded (45 s, `VFS495_PREARM_WINDOW`), one per lock period,
+  polite teardown; without a desktop lock signal (or after it expires) behaviour is exactly
+  as before. `VFS495_PREARM_FRESH` (20 s) caps how long a pre‑armed scan stays deliverable.
 - ⚠️ The secure session (SSLv3) is **fully reverse‑engineered and byte‑exact validated**, but the
   sensor enforces a pairing/provisioning gate we could not cross from the host — so, like every
   other VFS495 project, we let HP's proprietary binary establish the session (see

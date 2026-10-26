@@ -5,6 +5,13 @@ the real sensor and delivers the image to libfprint's virtual_image socket. When
 stops needing a finger (timeout, cancel, done) a still-running capture is cancelled, so the
 sensor is never held longer than an authentication actually lasts.
 
+Speed path (pre-arm): when the screen locks (org.gnome.ScreenSaver on the user session
+bus) the bridge starts ONE vendor session right away, so the tool is already armed when
+the user swipes at the lock screen. A good scan captured while fprintd is not asking yet
+is cached and handed over the instant finger-needed arrives, which takes the tool start
+(~0.5 s) and the capture wait out of the unlock. Pre-arm sessions are bounded
+(VFS495_PREARM_WINDOW, 45 s) and torn down politely; one pre-arm per lock period.
+
 Sensor-health handling (post-suspend / after a hard kill):
   * cancellation is polite (SIGTERM -> the capture wrapper deinits the vendor tool itself);
   * a forced kill marks the sensor for recovery, and two degenerate frames in a row trigger
@@ -13,7 +20,7 @@ Sensor-health handling (post-suspend / after a hard kill):
     that is already wedged must still be recovered by a full power-off.
 """
 import glob, os, signal, socket, struct, subprocess, sys, threading, time
-import dbus, dbus.mainloop.glib
+import dbus, dbus.bus, dbus.mainloop.glib
 from gi.repository import GLib
 
 SOCK = os.environ.get("FP_VIRTUAL_IMAGE", "/run/fprint/virtimg_sock")
@@ -36,12 +43,21 @@ RETRY_PAUSE = 2.5                           # wait before retrying after a tiny/
 CAPTURE_TIMEOUT = 18                        # seconds per attempt: a real swipe lands within ~2-10 s
 MAX_ATTEMPTS = 3                            # retries within one auth request (~60 s total)
 GRACE = 5.0                                 # seconds the capture wrapper gets to exit after SIGTERM
+PREARM_WINDOW = float(os.environ.get("VFS495_PREARM_WINDOW", "45"))
+                                            # how long a pre-arm session may stay armed after the
+                                            # screen locks; expired ones are torn down politely
+PREARM_FRESH = float(os.environ.get("VFS495_PREARM_FRESH", "20"))
+                                            # how long a pre-arm scan stays deliverable once fprintd asks
+PREARM_BACKSTOP = PREARM_WINDOW + 10        # wrapper-side timeout cap for pre-arm attempts
 USB_DRIVER = "/sys/bus/usb/drivers/usb"
 USB_IDS = ("138a", "003f")                  # Validity Sensors VFS495
 EXIT_OK, EXIT_NO_IMAGE, EXIT_ERROR, EXIT_FORCED = 0, 10, 11, 12
 lock = threading.Lock()
 state = {"proc": None, "capturing": False, "wanted": False, "gen": 0, "deferred": False,
-         "needs_reinit": False}
+         "needs_reinit": False, "locked": False, "cache": None, "mode": None,
+         "prearm_done": False}
+# mode: "auth" (worker serves fprintd) or "prearm" (worker armed by the screen lock;
+# it serves fprintd too the moment finger-needed arrives). cache: (w, h, data, ts).
 
 def log(m): print("[vfs495-bridge] " + m, file=sys.stderr, flush=True)
 
@@ -267,9 +283,9 @@ def archive_scan(w, h, data, std, sat, prefix=""):
         log(f"archive failed: {e}")
 
 
-def run_capture(out):
+def run_capture(out, timeout=CAPTURE_TIMEOUT):
     """One capture attempt. Returns the wrapper's exit code."""
-    p = subprocess.Popen([sys.executable, CAPTURE, out], env={**os.environ, "VFS_TIMEOUT": str(CAPTURE_TIMEOUT)},
+    p = subprocess.Popen([sys.executable, CAPTURE, out], env={**os.environ, "VFS_TIMEOUT": str(timeout)},
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     with lock: state["proc"] = p
     rc = p.wait()
@@ -285,30 +301,159 @@ def _recover(reason):
     return ok
 
 
-def capture_and_deliver(gen):
+def cache_store(w, h, data):
+    """Remember a good pre-arm scan: this lock period's unlock swipe, already assembled."""
+    with lock:
+        state["cache"] = (w, h, data, time.monotonic())
+
+
+def cache_take():
+    """Pop the cached pre-arm scan if it is still fresh (single consumer)."""
+    with lock:
+        c, state["cache"] = state["cache"], None
+    if c is None:
+        return None
+    w, h, data, ts = c
+    if time.monotonic() - ts > PREARM_FRESH:
+        log(f"pre-armed scan is {time.monotonic() - ts:.0f}s old -> ignoring it")
+        return None
+    return c
+
+
+def deliver_cached(img, gen):
+    """Fast path: hand an assembled pre-arm scan to fprintd. Holds the worker slot."""
+    w, h, data, ts = img
+    try:
+        stats, *_ = image_stats(w, h, data)
+        deliver(w, h, data)
+        log(f"delivered pre-armed scan {w}x{h} {stats} — {time.monotonic() - ts:.1f}s after the swipe")
+    except OSError as e:
+        log(f"pre-armed scan delivery failed ({e}) -> capturing instead")
+        with lock:
+            state["gen"] += 1
+            gen = state["gen"]
+            state["mode"] = "auth"
+        threading.Thread(target=capture_worker, args=(gen,), daemon=True).start()
+        return
+    with lock:
+        state["capturing"] = False
+        state["mode"] = None
+
+
+_lock_bus_paths = set()                     # user session buses we already follow
+
+def watch_screen_lock():
+    """Follow org.gnome.ScreenSaver on every user session bus (root may connect).
+
+    New/inactive sessions are picked up by the periodic refresh in main(); a lock that
+    already exists is noticed by a one-shot GetActive query after each connect.
+    """
+    added = 0
+    for path in sorted(glob.glob("/run/user/*/bus")):
+        if path in _lock_bus_paths:
+            continue
+        try:
+            conn = dbus.bus.BusConnection("unix:path=" + path)
+            conn.add_signal_receiver(on_lock_changed, signal_name="ActiveChanged",
+                                     dbus_interface="org.gnome.ScreenSaver",
+                                     path="/org/gnome/ScreenSaver")
+        except dbus.DBusException as e:
+            log(f"session bus {path}: connect failed ({e})")
+            continue
+        _lock_bus_paths.add(path)
+        added += 1
+        log(f"watching the screen lock on {path}")
+        GLib.timeout_add(3000, check_lock_state, conn)
+    return added
+
+
+def check_lock_state(conn):
+    try:
+        ss = dbus.Interface(conn.get_object("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver"),
+                            "org.gnome.ScreenSaver")
+        on_lock_changed(bool(ss.GetActive()), initial=True)
+    except dbus.DBusException:
+        pass                                    # no gnome-shell on that bus (yet)
+    return False
+
+
+def maybe_prearm():
+    with lock:
+        if state["capturing"] or state["wanted"] or state["prearm_done"]:
+            return
+        state["gen"] += 1
+        gen = state["gen"]
+        state["capturing"] = True
+        state["mode"] = "prearm"
+    log("screen locked -> pre-arming the sensor; swipe as soon as the lock screen is up")
+    threading.Thread(target=capture_worker, args=(gen,), daemon=True).start()
+
+
+def start_auth_capture(reason):
+    """Become the capture owner for an auth request; a fresh pre-arm scan skips capture."""
+    with lock:
+        state["gen"] += 1
+        gen = state["gen"]
+        state["capturing"] = True
+        state["mode"] = "auth"
+    cached = cache_take()
+    if cached is not None:
+        log(f"{reason} -> handing over the pre-armed scan (captured while locked)")
+        threading.Thread(target=deliver_cached, args=(cached, gen), daemon=True).start()
+        return
+    log(f"{reason} -> capturing; swipe now")
+    threading.Thread(target=capture_worker, args=(gen,), daemon=True).start()
+
+
+def capture_worker(gen):
+    """One capture owner, started by an auth request (mode 'auth') or by the screen lock
+    (mode 'prearm'). While fprintd is not waiting (pre-arm) a good scan is cached and
+    handed over the instant finger-needed arrives; the moment fprintd IS waiting, every
+    good scan is delivered directly and a pre-arm's window no longer applies."""
     os.makedirs(RUN, mode=0o700, exist_ok=True)
     out, last = RUN + "/cap.pgm", RUN + "/last.pgm"
     t0 = time.monotonic()
     delivered = False
     bad_streak = 0
+    attempts = 0
     try:
         if state["needs_reinit"]:
             _recover("previous capture needed a forced kill")
-        for attempt in range(MAX_ATTEMPTS):            # retry within one auth request (missed/partial swipe)
-            if attempt > 0:
+        while attempts < MAX_ATTEMPTS:
+            with lock:
+                superseded = state["gen"] != gen
+                prearm = state["mode"] == "prearm"
+                wanted = state["wanted"]
+                locked = state["locked"]
+            if superseded:
+                log("capture superseded -> exiting"); return
+            if prearm and not wanted:
+                if not locked:
+                    log("pre-arm cancelled (screen unlocked)"); return
+                if time.monotonic() - t0 > PREARM_WINDOW:
+                    log("pre-arm window expired -> disarming (sensor comfort)"); return
+            elif not wanted:
+                log("capture cancelled (fprintd no longer waiting)"); return
+            if attempts > 0:
                 # recovery pause between captures: rapid back-to-back captures make the
                 # sensor return tiny/degraded scans and trigger its own USB reset behaviour
-                if state["gen"] != gen or not state["wanted"]:
-                    log("capture cancelled (fprintd no longer waiting)"); return
                 time.sleep(RETRY_PAUSE)
                 log("retrying capture — swipe again if the finger prompt is still showing")
-            rc = run_capture(out)
+            attempts += 1
+            budget = CAPTURE_TIMEOUT
+            if prearm:
+                left = PREARM_WINDOW - (time.monotonic() - t0) + 5.0
+                budget = max(5.0, min(PREARM_BACKSTOP, left))
+            rc = run_capture(out, timeout=budget)
             if rc == EXIT_FORCED:
                 log("capture wrapper had to force-kill the vendor tool -> re-enumerating USB")
                 _recover("forced kill during capture")
                 bad_streak = 0
                 continue
-            if state["gen"] != gen or not state["wanted"]:
+            with lock:
+                wanted = state["wanted"]
+                locked = state["locked"]
+            if not wanted and not (prearm and locked):
                 log("capture cancelled (fprintd no longer waiting)"); return
             ok = rc == EXIT_OK
             if ok:
@@ -338,29 +483,35 @@ def capture_and_deliver(gen):
                 else:
                     bad_streak = 0
                     archive_scan(*img, std, sat)
-                    try:
-                        deliver(*img)
-                        delivered = True
-                        log(f"delivered scan {img[0]}x{img[1]} {stats} after {time.monotonic()-t0:.1f}s")
+                    if wanted:
+                        try:
+                            deliver(*img)
+                            delivered = True
+                            log(f"delivered scan {img[0]}x{img[1]} {stats} after {time.monotonic()-t0:.1f}s")
+                            return
+                        except OSError as e:
+                            log(f"deliver failed: {e}"); return
+                    else:
+                        cache_store(*img)
+                        log(f"pre-armed scan ready ({img[0]}x{img[1]} {stats}) — "
+                            "fprintd gets it the moment it asks")
                         return
-                    except OSError as e:
-                        log(f"deliver failed: {e}"); return
             if not ok:
-                last_attempt = attempt + 1 == MAX_ATTEMPTS
+                last_attempt = attempts >= MAX_ATTEMPTS
                 log("no usable finger scan" + (" (give up)" if last_attempt else ", retrying"))
     finally:
         try: os.unlink(out)
         except OSError: pass
-        state["capturing"] = False
-        # A new request that arrived while this capture was shutting down must not be lost.
-        deferred, state["deferred"] = state["deferred"], False
+        with lock:
+            was_prearm = state["mode"] == "prearm"
+            state["capturing"] = False
+            state["mode"] = None
+            if was_prearm and state["locked"]:
+                state["prearm_done"] = True    # one pre-arm per lock period
+            deferred, state["deferred"] = state["deferred"], False
         if deferred and state["wanted"] and not delivered:
-            with lock:
-                state["capturing"] = True
-                state["gen"] += 1
-                new_gen = state["gen"]
-            log("new finger request arrived during shutdown -> capturing for it")
-            threading.Thread(target=capture_and_deliver, args=(new_gen,), daemon=True).start()
+            # A new request that arrived while this capture was shutting down must not be lost.
+            start_auth_capture("new finger request arrived during shutdown")
 
 def on_needed(reason):
     was_wanted = state["wanted"]
@@ -369,18 +520,34 @@ def on_needed(reason):
         if not was_wanted:
             state["deferred"] = True          # may be a fresh request, not the same one
         return
-    with lock:
-        state["gen"] += 1
-        gen = state["gen"]
-        state["capturing"] = True
-    log(f"finger needed ({reason}) -> capturing; swipe now")
-    threading.Thread(target=capture_and_deliver, args=(gen,), daemon=True).start()
+    start_auth_capture(f"finger needed ({reason})")
 
 def on_not_needed():
     if not state["wanted"]: return
     state["wanted"] = False
-    if state["capturing"]:
+    with lock:
+        prearm = state["mode"] == "prearm"
+    if state["capturing"] and not prearm:
+        # a pre-arm session outlives a fprintd cancel: the screen is still locked
         state["gen"] += 1; kill_capture()
+
+def on_lock_changed(active, initial=False):
+    if active:
+        if state["locked"]: return
+        state["locked"] = True
+        if initial:
+            log("screen was already locked")
+        maybe_prearm()
+    else:
+        if not state["locked"]: return
+        state["locked"] = False
+        log("screen unlocked")
+        with lock:
+            stop_prearm = state["mode"] == "prearm" and state["capturing"]
+            state["cache"] = None
+            state["prearm_done"] = False
+        if stop_prearm:
+            state["gen"] += 1; kill_capture()
 
 def on_props_changed(iface, changed, invalidated, path=None):
     if iface != DEV_IFACE or "finger-needed" not in changed: return
@@ -388,6 +555,13 @@ def on_props_changed(iface, changed, invalidated, path=None):
     else: on_not_needed()
 
 def on_verify_selected(*args, path=None): on_needed("verify started")
+
+VERIFY_STATUS_NAMES = {0: "match", 1: "no match", 100: "retry, scan again",
+                       101: "swipe too short", 102: "not centered",
+                       103: "remove finger and retry"}
+
+def on_verify_status(code, done, path=None):
+    log(f"verify result: {VERIFY_STATUS_NAMES.get(int(code), 'code ' + str(int(code)))} (done={bool(done)})")
 
 def _on_sigterm(signum, frame):
     raise SystemExit(0)
@@ -399,6 +573,8 @@ def main():
                             bus_name=BUS_NAME, path_keyword="path")
     bus.add_signal_receiver(on_verify_selected, signal_name="VerifyFingerSelected", dbus_interface=DEV_IFACE,
                             bus_name=BUS_NAME, path_keyword="path")
+    bus.add_signal_receiver(on_verify_status, signal_name="VerifyStatus", dbus_interface=DEV_IFACE,
+                            bus_name=BUS_NAME, path_keyword="path")
     def check_initial():                                # a scan already pending at startup?
         try:
             mgr = dbus.Interface(bus.get_object(BUS_NAME, "/net/reactivated/Fprint/Manager"), "net.reactivated.Fprint.Manager")
@@ -407,13 +583,19 @@ def main():
                 if bool(p.Get(DEV_IFACE, "finger-needed")): on_needed("pending at startup")
         except dbus.DBusException: pass
         return False
+    def refresh_lock_watch():                           # new sessions / re-login
+        watch_screen_lock()
+        return True
     signal.signal(signal.SIGTERM, _on_sigterm)
     GLib.timeout_add(1500, check_initial)
+    watch_screen_lock()
+    GLib.timeout_add_seconds(120, refresh_lock_watch)
     log("idle; waiting for fprintd to need a finger")
     try:
         GLib.MainLoop().run()
     finally:
         state["wanted"] = False
+        state["cache"] = None
         if state["capturing"]:
             state["gen"] += 1
             kill_capture()
