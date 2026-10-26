@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(dirname "$SRC")"
+REPO="$(cd "$SRC/../.." && pwd)"
 BRIDGE_SRC="$REPO/tools/vfs495_bridge_fedora.py"
 BRIDGE_DST=/usr/local/libexec/vfs495-fedora-bridge.py
 
@@ -18,6 +18,9 @@ command -v systemctl >/dev/null 2>&1 || { echo "ERROR: systemctl missing"; exit 
 install -Dm644 "$SRC/fprintd.service.d/virtimg.conf" /etc/systemd/system/fprintd.service.d/virtimg.conf
 
 install -Dm755 "$BRIDGE_SRC" "$BRIDGE_DST"
+
+# Suspend/resume hygiene: stop the bridge before sleep, re-enumerate the reader after.
+install -Dm755 "$SRC/system-sleep/vfs495-bridge" /usr/lib/systemd/system-sleep/vfs495-bridge
 
 cat > /etc/systemd/system/vfs495-bridge.service < "$SRC/vfs495-bridge.service"
 

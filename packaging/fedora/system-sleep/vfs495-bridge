@@ -1,0 +1,92 @@
+#!/bin/sh
+# VFS495 fingerprint sensor hygiene across suspend/resume.
+#
+# Installed as /usr/lib/systemd/system-sleep/vfs495-bridge
+#
+# Why: after resume the reader sometimes answers captures with degenerate frames
+# (std > 85) and then with no image at all, until the machine is powered off. The
+# vendor tool's USB session does not survive suspend cleanly, and a capture killed
+# while the bus is going down makes it worse. So:
+#   pre  - stop the bridge (no capture in flight), then make sure no vendor/gdb survives
+#   post - force a clean USB re-enumeration (unbind/bind) before the bridge starts
+#
+# This is a soft replug, not a USBDEVFS_RESET: reset produced kernel descriptor
+# errors (-32/-71) on this reader. If the sensor is already wedged, only a full
+# power-off recovers it; this hook exists to stop that from happening.
+
+set -u
+
+TAG="vfs495-sleep"
+UNIT="vfs495-bridge.service"
+CAPTURE_RE='/tools/vfs495_capture_asm[.]py'
+SYSTEMCTL=/usr/bin/systemctl
+PKILL=/usr/bin/pkill
+
+find_device() {
+    for d in /sys/bus/usb/devices/*; do
+        [ -r "$d/idVendor" ] || continue
+        case "${d##*/}" in *:*) continue ;; esac
+        [ "$(cat "$d/idVendor" 2>/dev/null)" = "138a" ] || continue
+        [ "$(cat "$d/idProduct" 2>/dev/null)" = "003f" ] || continue
+        printf '%s\n' "${d##*/}"
+        return 0
+    done
+    return 1
+}
+
+stop_bridge() {
+    echo "$TAG: stopping $UNIT before sleep"
+    "$SYSTEMCTL" stop "$UNIT" 2>/dev/null || true
+    # Fallback only: finish off a capture wrapper that outlived the service cgroup.
+    "$PKILL" -TERM -f "$CAPTURE_RE" 2>/dev/null || true
+    i=0
+    while [ "$i" -lt 15 ]; do
+        "$PKILL" -0 -f "$CAPTURE_RE" 2>/dev/null || return 0
+        sleep 0.2
+        i=$((i + 1))
+    done
+    echo "$TAG: capture wrapper ignored SIGTERM, forcing it"
+    "$PKILL" -KILL -f "$CAPTURE_RE" 2>/dev/null || true
+}
+
+replug_sensor() {
+    dev=""
+    i=0
+    while [ "$i" -lt 50 ]; do                 # USB may need a moment to come back
+        dev="$(find_device)" && break
+        sleep 0.2
+        i=$((i + 1))
+    done
+    if [ -z "$dev" ]; then
+        echo "$TAG: sensor not present after resume; starting $UNIT anyway"
+        return 0
+    fi
+    echo "$TAG: re-enumerating USB device $dev"
+    echo "$dev" > /sys/bus/usb/drivers/usb/unbind 2>/dev/null || true
+    sleep 1
+    echo "$dev" > /sys/bus/usb/drivers/usb/bind 2>/dev/null || true
+    sleep 1
+}
+
+start_bridge() {
+    # Never resurrect a service the admin disabled on purpose.
+    if "$SYSTEMCTL" is-enabled --quiet "$UNIT" 2>/dev/null; then
+        echo "$TAG: starting $UNIT after resume"
+        "$SYSTEMCTL" start "$UNIT" 2>/dev/null || true
+    fi
+}
+
+case "${1:-}" in
+    pre)
+        stop_bridge
+        ;;
+    post)
+        replug_sensor
+        start_bridge
+        ;;
+    *)
+        echo "$TAG: unknown phase '${1:-}'" >&2
+        exit 1
+        ;;
+esac
+exit 0
