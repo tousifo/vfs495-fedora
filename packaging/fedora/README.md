@@ -13,6 +13,7 @@ Fedora 44 with `fprintd-1.94.5` / `libfprint-1.94.100`.
 |------|--------------|---------|
 | `vfs495-bridge.service` | `/etc/systemd/system/vfs495-bridge.service` | Runs the capture bridge as root (needs USB + gdb approval) |
 | `fprintd.service.d/virtimg.conf` | `/etc/systemd/system/fprintd.service.d/virtimg.conf` | Makes fprintd start its `virtual_image` device at `/run/fprint/virtimg_sock` |
+| `system-sleep/vfs495-bridge` | `/usr/lib/systemd/system-sleep/vfs495-bridge` | Suspend hygiene: stop the bridge before sleep, re-enumerate the reader after resume |
 | `install-fedora.sh` | — | Copies everything into place, enables the service, sets up authselect |
 
 The bridge script itself lives in the repo at `tools/vfs495_bridge_fedora.py`
@@ -93,9 +94,20 @@ as fallback, but you should keep an hour for plan B: password always works).
   unsharp and morphological variants of six archived scans moved scores by
   -8…+11 with no consistent sign; only one of four failing scans crossed 40 and
   others regressed. Nothing of the sort is applied by the bridge.
+- **Suspend/resume hygiene (validated 2026-10-27).** The sleep hook stops the
+  bridge before suspend (so no capture is ever killed mid-USB-session) and on
+  resume re-enumerates the reader via sysfs unbind/bind (a soft replug — never
+  `USBDEVFS_RESET`, which produced kernel descriptor errors -32/-71 here) before
+  restarting it. Measured on a real S3 cycle: bridge idle again 2 s after resume,
+  healthy frames (std 28), `verify-match` 20 s after resume — where the
+  pre-hardening pipeline degenerated (std > 90) and wedged the sensor until a
+  full power-off. The bridge also recovers on its own: a forced kill or two
+  consecutive degenerate frames trigger the same unbind/bind mid-session.
 - "Stuck state": after many rapid captures the sensor returns tiny scans
   (height < 180, e.g. 200x12/200x15). `MIN_ROWS=180` in the bridge rejects those
-  and retries twice. Only a **full power-off** clears the stuck sensor; warm
-  reboot / USB re-enumeration does NOT.
+  and retries twice. A sensor that is *already wedged* (zero frames despite
+  swipes) still needs a **full power-off**; warm reboot / USB re-enumeration
+  does NOT heal it. The hardening (graceful shutdown + automatic re-enumeration)
+  exists to stop the pipeline from reaching that state in the first place.
 - Debug scores: `journalctl -u fprintd | grep 'score'` (threshold `n/40`).
   Raw last delivered image: `/run/vfs495-fprint/last.pgm` (root-only).

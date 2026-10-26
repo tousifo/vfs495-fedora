@@ -476,3 +476,53 @@ consistent sign: only one of four failing scans crossed 40 (39 -> 42 with CLAHE 
 others regressed (17 -> 9 with the same filter). Mean best score: 35.8 raw vs 38.8 CLAHE,
 driven mostly by scans that already matched. No preprocessing is applied by the bridge —
 swipe/contact quality remains the dominant factor.
+
+## Capture-lifecycle hardening: the post-suspend wedge, root cause and fix (2026-10-27)
+
+**Symptom chain.** After a suspend/resume the first captures returned degenerate
+frames (200x259 std 105/104/98; healthy is std 30–60), then 200x40 "too short",
+then zero frames even with confirmed swipes. A `usbreset` (USBDEVFS_RESET) made
+it worse — kernel descriptor errors -32/-71 — and sysfs unbind/bind re-enumerated
+the bus cleanly but still produced zero frames, because the sensor was already
+wedged. Only a full power-off recovered it.
+
+**Root cause.** The capture-stop path was violent: the bridge's `kill_capture()`
+did SIGTERM to the process group followed by an *immediate* `pkill -9 -f
+validity-sensor-unlocked`, and the capture wrapper's timeout path also did a
+blind `pkill -9`. Hard-killing the vendor tool mid-USB-session can leave the
+sensor waiting for a transfer that never completes. Suspend merely made the
+pre-existing violence visible: something (a capture in flight while the bus went
+down, or the resume itself) hit the same wedged state.
+
+**Fix (commit 47c2ace, installed + validated).**
+- `tools/vfs495_capture_asm.py`: SIGTERM handler → orderly unwind; gdb gets
+  SIGTERM with 2 s grace, SIGKILL only as a last resort. Exit codes let the
+  bridge act: 0 ok | 10 no image | 11 timeout (cleaned) | 12 *forced kill → USB
+  re-enumeration needed* | 13 cancelled.
+- `tools/vfs495_bridge_fedora.py`: `kill_capture()` SIGTERMs the wrapper's group
+  and waits 5 s before escalating, then marks `needs_reinit`; exit code 12 or
+  **two consecutive sensor-side bad frames** (std > 85, sat > 25) trigger
+  `reinit_sensor()` — a sysfs unbind/bind soft replug of the 138a:003f device
+  (never USBDEVFS_RESET, see kernel errors above). Rejected scans are archived
+  with a `rej-` prefix (keep 20; 40 good) so regressions have evidence.
+  A finger request arriving while a capture shuts down is deferred, not dropped.
+- Process matching is by `/proc/*/exe` basename, **never** by cmdline substring:
+  an earlier pkill-by-substring variant killed the agent's own shell (a bash -c
+  whose script text merely mentioned the binary got matched). Unit-tested in
+  `tools/test_hardening.py` (9 tests, no sensor/root needed).
+- `packaging/fedora/system-sleep/vfs495-bridge`: systemd sleep hook — pre:
+  stop the bridge (no capture in flight) + pkill fallbacks; post: wait up to 10 s
+  for the sensor, unbind/bind it, restart the bridge if still enabled.
+
+**Validation (2026-10-27, this machine).**
+- Normal operation: verify-match through the hardened bridge (partial-contact
+  rejections archived, delivery on 3rd attempt within one prompt).
+- Suspend/resume (S3, 01:12:39 → 01:12:53): hook stopped the bridge cleanly
+  before sleep; post-resume it re-enumerated `4-1.3` and restarted the bridge
+  (idle again within 2 s); the unlock swipe produced one *partial-contact*
+  rejection (56 % cover — human swipe, not sensor damage), then a healthy
+  200x300 std=28 frame and `verify-match` 20 s after resume. No degenerate
+  frames, no wedge, no power-off.
+- The "stuck sensor" advice stands: a *wedged* sensor (zero frames at all) still
+  needs a full power-off — the hardening prevents getting there, it cannot heal
+  an already-wedged sensor.
