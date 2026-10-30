@@ -23,6 +23,8 @@ VENDOR = RUNTIME + "/bin/validity-sensor-unlocked"
 HARVEST = RUNTIME + "/harvest_assembled.py"
 EXIT_OK, EXIT_NO_IMAGE, EXIT_ERROR, EXIT_FORCED, EXIT_CANCELLED = 0, 10, 11, 12, 13
 GRACE = 2.0                     # seconds a polite SIGTERM gets before we escalate
+STABLE_SECS = 0.3               # assembled image unchanged this long = finger lifted
+MIN_ROWS = 180                  # enough assembled rows to be worth an early delivery
 _proc = None                    # gdb, set once it is running (needed by the SIGTERM handler)
 
 
@@ -73,9 +75,15 @@ def _wait_gone(seconds):
     return not session_pids()
 
 
-def reap_session(grace=GRACE):
-    """Stop leftover gdb/vendor processes politely. Returns True if SIGKILL was needed."""
+def reap_session(grace=GRACE, patient=0.0):
+    """Stop leftover gdb/vendor processes politely. Returns True if SIGKILL was needed.
+
+    A leftover from an early-delivery capture is mid-teardown and exits by itself:
+    wait up to `patient` seconds for a natural drain before signalling anything —
+    a SIGTERM into a live deinit is the classic wedge."""
     if _wait_gone(0):
+        return False
+    if patient and _wait_gone(patient):
         return False
     for pid in session_pids():
         try: os.kill(pid, signal.SIGTERM)
@@ -120,35 +128,66 @@ def _on_sigterm(signum, frame):
 
 
 def _watch_assembly(proc, asm, timeout):
-    """Run proc to completion while following the harvest file.
+    """Run proc while following the harvest file.
 
     The gdb breakpoint rewrites the file on every assembled-frame callback, so its
     mtime marks first finger contact, swipe progress, and the moment the tool stops
-    producing frames. The teardown tail (tool deinit + gdb quit) cannot be skipped:
-    the vendor tool must deinit the sensor itself or the reader wedges.
-    Returns (rc, phase); rc is None on timeout. Phase values are seconds since spawn.
+    producing frames. Once the image has >= MIN_ROWS rows and has been unchanged for
+    STABLE_SECS the finger is off the sensor and the assembly is final — the caller
+    can deliver immediately instead of waiting out the tool's ~1 s teardown (the
+    vendor tool then finishes its own deinit in the background; every cleanup path
+    waits for it patiently instead of killing it mid-session).
+    Returns (rc, phase, early); rc is None on timeout. Phase values: seconds since spawn.
     """
     t0 = time.monotonic()
     phase = {"first_frame_s": None, "last_frame_s": None, "gdb_exit_s": None}
     prev = object()
+    stable_since = None
     while True:
         rc = proc.poll()
+        rows = 0
         try:
             st = os.stat(asm)
-            if st.st_size >= 8 and st.st_mtime != prev:
-                now = time.monotonic() - t0
-                if phase["first_frame_s"] is None:
-                    phase["first_frame_s"] = now
-                phase["last_frame_s"] = now
-                prev = st.st_mtime
-        except OSError:
+            if st.st_size >= 8:
+                if st.st_mtime != prev:
+                    now = time.monotonic() - t0
+                    if phase["first_frame_s"] is None:
+                        phase["first_frame_s"] = now
+                    phase["last_frame_s"] = now
+                    prev = st.st_mtime
+                    stable_since = now
+                with open(asm, "rb") as f:
+                    rows = struct.unpack("<II", f.read(8))[1]
+        except (OSError, struct.error):
             pass
         if rc is not None:
             phase["gdb_exit_s"] = time.monotonic() - t0
-            return rc, phase
-        if time.monotonic() - t0 >= timeout:
-            return None, phase
+            return rc, phase, False
+        now = time.monotonic() - t0
+        if stable_since is not None and rows >= MIN_ROWS and now - stable_since >= STABLE_SECS:
+            return None, phase, True
+        if now >= timeout:
+            return None, phase, False
         time.sleep(0.05)
+
+
+def _early_deliver(asm, out, phase):
+    """Write the stable assembled image for immediate delivery. True on success."""
+    with open(asm, "rb") as f:
+        d = f.read()
+    if len(d) < 16:
+        return False
+    w, h = struct.unpack("<II", d[:8])
+    if not (0 < w <= 5000 and 0 < h <= 20000) or len(d) < 8 + w * h:
+        return False
+    img = np.frombuffer(d[8:8 + w * h], np.uint8).reshape(h, w)
+    with open(out, "wb") as f:
+        f.write(f"P5\n{w} {h}\n255\n".encode())
+        f.write(np.ascontiguousarray(img).tobytes())
+    _write_timing(out, phase, {"cols": w, "rows": h, "early": True})
+    print("early deliver %dx%d — vendor tool finishes its teardown in the background"
+          % (w, h), file=sys.stderr)
+    return True
 
 
 def _write_timing(out, phase, dims=None):
@@ -171,7 +210,8 @@ def main():
 
     # Never start a second vendor session on top of a stale one: that is the classic way
     # to get two processes doing -doinit on the same reader and zero frames afterwards.
-    if reap_session():
+    # A leftover early-delivery orphan is mid-teardown: wait up to 3 s for it to drain.
+    if reap_session(patient=3.0):
         print("stale sensor session needed SIGKILL before capture", file=sys.stderr)
         return EXIT_FORCED
 
@@ -185,8 +225,18 @@ def main():
     _proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
     phase = {}
+    t_start = time.monotonic()
     try:
-        rc, phase = _watch_assembly(_proc, asm, timeout)
+        rc, phase, early = _watch_assembly(_proc, asm, timeout)
+        if early:
+            if _early_deliver(asm, out, phase):
+                _proc = None          # skip the finally cleanup: the orphan must live
+                return EXIT_OK
+            print("early deliver failed -> waiting for gdb to exit", file=sys.stderr)
+            try:
+                rc = _proc.wait(timeout=max(1.0, timeout - (time.monotonic() - t_start)))
+            except subprocess.TimeoutExpired:
+                rc = None
         if rc is None:
             raise subprocess.TimeoutExpired(cmd, timeout)
     except subprocess.TimeoutExpired:
@@ -209,7 +259,8 @@ def main():
             stop_gdb(_proc)
 
     # gdb exited on its own; make sure it did not leave the vendor session behind.
-    if reap_session(1.0):
+    # Leftovers can also be earlier early-delivery orphans (mid-teardown) — be patient.
+    if reap_session(1.0, patient=2.0):
         print("stale sensor session cleaned after capture", file=sys.stderr)
         _write_timing(out, phase)
         try: os.unlink(asm)

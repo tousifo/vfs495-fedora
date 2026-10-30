@@ -17,11 +17,13 @@ sys.path.insert(0, os.path.join(RE, "tools"))
 import vfs495_bridge_fedora as bridge
 import vfs495_capture_asm as wrapper
 
-# argv[1] == "s" makes the decoy ignore SIGTERM (stubborn), otherwise it exits on it.
+# argv[1]: "s" ignores SIGTERM (stubborn), "t" exits by itself after ~1 s (a mid-teardown
+# early-delivery orphan), anything else exits on SIGTERM.
 DECOY_C = """#include <signal.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == 's') signal(SIGTERM, SIG_IGN);
+    if (argc > 1 && argv[1][0] == 't') { sleep(1); return 0; }
     pause();
     return 0;
 }
@@ -75,6 +77,12 @@ class HardeningTest(unittest.TestCase):
         exe = compile_decoy(self.tmp, "gdb-harvest-decoy")
         return self.spawn([exe, "x", bridge.HARVEST], start_new_session=True)
 
+    def decoy_teardown(self):
+        """A matched decoy that exits by itself after ~1 s, like an early-delivery
+        orphan finishing its vendor-tool teardown."""
+        exe = compile_decoy(self.tmp, "validity-sensor-unlocked")
+        return self.spawn([exe, "t"], start_new_session=True)
+
     def decoy_python_mentioning_names(self):
         """A python process whose cmdline text mentions the binary names — must NEVER match."""
         code = ("# talks about /runtime/bin/validity-sensor-unlocked and "
@@ -103,6 +111,26 @@ class HardeningTest(unittest.TestCase):
         p = self.decoy_vendor(stubborn=True)
         self.assertTrue(wrapper.reap_session(grace=0.5))
         self.assertIsNotNone(p.poll())
+
+    def test_reap_session_waits_for_natural_teardown(self):
+        """An early-delivery orphan (mid-teardown) must drain by itself: no signal, False."""
+        p = self.decoy_teardown()
+        self.assertFalse(wrapper.reap_session(grace=0.5, patient=3.0))
+        self.assertIsNotNone(p.poll())
+
+    def test_bridge_kill_capture_waits_for_orphan_teardown(self):
+        """Wrapper already gone + an orphan that is draining: patient wait, no force."""
+        bridge.GRACE = 1.0
+        self.spawn(["/bin/sleep", "0.05"], start_new_session=True).wait()
+        p = self.decoy_teardown()
+        with bridge.lock: bridge.state["proc"] = p  # replaced by a dead proc below
+        dead = self.spawn(["/bin/sleep", "0.05"])
+        dead.wait()
+        with bridge.lock: bridge.state["proc"] = dead
+        self.assertFalse(bridge.kill_capture())
+        with bridge.lock:
+            self.assertFalse(bridge.state["needs_reinit"])
+            bridge.state["proc"] = None
 
     def test_stop_gdb_without_proc_reaps_orphans(self):
         p = self.decoy_gdb()

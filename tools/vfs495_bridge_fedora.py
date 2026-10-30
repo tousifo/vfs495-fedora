@@ -103,6 +103,8 @@ def timing_note(t):
         parts.append("swipe %.1fs" % (t["last_frame_s"] - t["first_frame_s"]))
         if t.get("gdb_exit_s") is not None:
             parts.append("teardown %.1fs" % (t["gdb_exit_s"] - t["last_frame_s"]))
+        elif t.get("early"):
+            parts.append("delivered early, tool tearing down")
     return " [" + ", ".join(parts) + "]"
 
 
@@ -210,7 +212,15 @@ def kill_capture():
     if not p:
         return False
     if p.poll() is not None:
-        # wrapper already gone; make sure it did not leave gdb/the vendor behind
+        # wrapper already gone; make sure it did not leave gdb/the vendor behind.
+        # Early-delivery orphans are mid-teardown and exit by themselves: give them
+        # 3 s to drain before touching them — a TERM into a live deinit wedges the
+        # sensor.
+        if not capture_pids():
+            return False
+        end = time.monotonic() + 3.0
+        while capture_pids() and time.monotonic() < end:
+            time.sleep(0.1)
         if not capture_pids():
             return False
         log("leftover capture processes after the wrapper exited -> cleaning up")
