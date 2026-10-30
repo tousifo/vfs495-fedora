@@ -570,3 +570,58 @@ after 25 s — long before the agent's PAM fallback (fingerprint-first on this m
 `/etc/polkit-1/rules.d/45-manage-units-wheel.rules` granting `YES` on
 `manage-units` for local active wheel users, or re-authenticate right before a root
 step. `pkexec`/`sudo` remain unusable inside ZCode (NoNewPrivs).
+
+## Speed + robustness round: measured (2026-10-31)
+
+**Phase timing instrumentation.** The wrapper follows the harvest file's mtime (the
+gdb breakpoint rewrites it on every assembled-frame callback) and writes
+`<out>.timing` JSON next to each capture; the bridge logs
+`[first contact +Xs, swipe Ys, teardown Zs]` per attempt. Measured values:
+first contact 1.7–3.3 s (tool start ~0.5 s + human reaction), swipe 2.0–2.4 s,
+teardown ~1.0 s, fprintd match ~0.3 s. `no frames produced` while the user is
+swiping is the wedge signature; two zero-frame attempts in one prompt now trigger
+the sysfs unbind/bind recovery while the prompt is still open.
+
+**The quality gate was throwing away matches.** A boot-login frame rejected as
+"degenerate" (200x287, std 88, sat 26 %) scored **85/40 = MATCH** against the
+enrolled gallery offline (`tools/vfs495_score_image.py`), while genuinely flat
+sensor-junk frames (200x70/200x187, std 11) score 0–6/40 and are caught by the
+cover gate anyway. Consequence: std/saturation no longer block delivery (they
+only feed the recovery counter); rows < 180 and cover < 60 % stay as the gate.
+Lesson: gate on *structure* (is there a print at all?), let the matcher judge
+content — fprintd's 40/40 threshold is robust to noise that heuristics are not.
+
+**fprintd's verify window is ~30 s, and the prompt dies sooner when the user
+types.** The old fixed 18 s attempt meant a missed first swipe left the retry
+~9 s and it got cancelled mid-swipe (four failed rounds observed 08:53–08:56).
+Attempts are now 3 × 10 s with the last taking the remainder; pause between
+attempts is 1.2 s after clean captures, 2.5 s after sensor-side bad frames
+(`VFS495_RETRY_PAUSE`, `VFS495_RETRY_PAUSE_FAST`).
+
+**Early delivery.** The last harvest write is the final image, so the wrapper
+delivers as soon as the assembly is ≥ 180 rows and stable for 0.3 s instead of
+waiting out the ~1 s teardown: verdict < 1 s after the finger lifts (was ~2 s).
+The vendor tool finishes its deinit as a background orphan; every cleanup path
+(reap_session at capture start/post-exit, kill_capture's wrapper-gone branch)
+waits up to 3 s for a natural drain first — a TERM into a live deinit is the
+classic wedge.
+
+**Pre-arm on screen lock — first live fire.** The original implementation never
+worked: logind's `ListSessions()` tuple was indexed as `sess[1]` (the UInt32
+uid) instead of the object path, so the lock check always threw and was
+swallowed — four days of journal show zero pre-arm lines. Now the object path is
+found by shape, and a 1 s poll of `LockedHint` replaced the user-bus ScreenSaver
+watcher (dbus-broker refuses root there). Live evidence: `screen locked ->
+pre-arming` at +0 s, `pre-armed scan ready` at +7 s (user swipe assembled and
+cached before PAM asked), cache handed over on `finger-needed`.
+
+**Unrelated but discovered on the way: systemd can fall off the system bus.**
+`Got disconnect on API bus` (2026-10-31 03:21:06) left `org.freedesktop.systemd1`
+ownerless: systemctl hung, DBus-activated services (fprintd!) reported "The name
+is not activatable", and GNOME's lock screen stopped *offering* fingerprint
+entirely — a system problem that looks exactly like a fingerprint regression.
+The broker itself stays alive (logind keeps working), so the recovery is to
+restart dbus-broker, which forces PID 1 to reconnect; `systemd-run --wait`
+signal-subscription paths also hung while plain method calls worked (use
+`--no-block` + poll). If the fingerprint option disappears from the lock screen,
+check `busctl list | grep systemd1` before touching the fingerprint stack.
