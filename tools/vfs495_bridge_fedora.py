@@ -457,6 +457,7 @@ def capture_worker(gen):
     t0 = time.monotonic()
     delivered = False
     bad_streak = 0
+    zero_frames = 0
     sensor_bad = False
     attempts = 0
     try:
@@ -554,6 +555,17 @@ def capture_worker(gen):
                 last_attempt = attempts >= MAX_ATTEMPTS
                 log("no usable finger scan" + (" (give up)" if last_attempt else ", retrying")
                     + timing_note(timing))
+                # Two attempts in one prompt with not a single frame = the sensor is not
+                # seeing anything (stale session / wedged-ish). Re-enumerate while the
+                # prompt is still open instead of burning the round.
+                if timing.get("first_frame_s") is None:
+                    zero_frames += 1
+                    if zero_frames >= 2 and not last_attempt:
+                        log("two zero-frame attempts in one prompt -> USB re-enumeration")
+                        _recover("zero-frame attempts")
+                        zero_frames = 0
+                else:
+                    zero_frames = 0
     except Exception as e:
         log(f"capture worker error: {e!r}")
     finally:
