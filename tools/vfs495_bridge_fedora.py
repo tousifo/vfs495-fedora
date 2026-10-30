@@ -9,10 +9,10 @@ Speed path (pre-arm): when the screen locks the bridge starts ONE vendor session
 away, so the tool is already armed when the user swipes at the lock screen. A good scan
 captured while fprintd is not asking yet is cached and handed over the instant
 finger-needed arrives, which takes the tool start (~0.5 s) and the capture wait out of
-the unlock. The lock source is logind's LockedHint (set by mutter, visible on the system
-bus); org.gnome.ScreenSaver on user session buses is followed best-effort but dbus-broker
-refuses root there. Pre-arm sessions are bounded (VFS495_PREARM_WINDOW, 45 s) and torn
-down politely; one pre-arm per lock period.
+the unlock. The lock source is a 1 s poll of logind's LockedHint (mutter sets it on every
+lock; the system bus accepts root where user session buses refuse it), with the
+PropertiesChanged signal as an instant path. Pre-arm sessions are bounded
+(VFS495_PREARM_WINDOW, 45 s) and torn down politely; one pre-arm per lock period.
 
 Sensor-health handling (post-suspend / after a hard kill):
   * cancellation is polite (SIGTERM -> the capture wrapper deinits the vendor tool itself);
@@ -21,7 +21,7 @@ Sensor-health handling (post-suspend / after a hard kill):
   * recovery = unbind/bind the USB device (re-enumeration), never a SIGKILL loop. A sensor
     that is already wedged must still be recovered by a full power-off.
 """
-import glob, os, signal, socket, struct, subprocess, sys, threading, time
+import glob, json, os, signal, socket, struct, subprocess, sys, threading, time
 import dbus, dbus.bus, dbus.mainloop.glib
 from gi.repository import GLib
 
@@ -41,9 +41,14 @@ SCAN_DIR = RUN + "/scans"                   # archive: 40 delivered scans + 20 r
 BUS_NAME, DEV_IFACE = "net.reactivated.Fprint", "net.reactivated.Fprint.Device"
 PROPS = "org.freedesktop.DBus.Properties"
 CAPTURE_PAUSE = 1.5                         # kept for documentation; applied only between retries
-RETRY_PAUSE = 2.5                           # wait before retrying after a tiny/failed scan
-CAPTURE_TIMEOUT = 18                        # seconds per attempt: a real swipe lands within ~2-10 s
-MAX_ATTEMPTS = 3                            # retries within one auth request (~60 s total)
+RETRY_PAUSE = float(os.environ.get("VFS495_RETRY_PAUSE", "2.5"))
+                                            # wait before retrying after sensor-side bad frames
+RETRY_PAUSE_FAST = float(os.environ.get("VFS495_RETRY_PAUSE_FAST", "1.2"))
+                                            # wait after clean captures: a missed swipe must not eat
+                                            # the whole verify window (fprintd cancels after ~30 s)
+CAPTURE_TIMEOUT = 10                        # per-attempt budget; the LAST attempt gets the remainder
+AUTH_WINDOW = float(os.environ.get("VFS495_AUTH_WINDOW", "28"))   # fprintd cancels the verify at ~30 s
+MAX_ATTEMPTS = 3                            # retries within one auth request
 GRACE = 5.0                                 # seconds the capture wrapper gets to exit after SIGTERM
 PREARM_WINDOW = float(os.environ.get("VFS495_PREARM_WINDOW", "45"))
                                             # how long a pre-arm session may stay armed after the
@@ -67,6 +72,41 @@ def read_pgm(p):
     with open(p, "rb") as f:
         assert f.readline().strip() == b"P5"; w, h = map(int, f.readline().split()); f.readline()
         return w, h, f.read(w * h)
+
+
+def read_timing(out):
+    """Phase timings the capture wrapper wrote next to the image (best effort)."""
+    try:
+        with open(out + ".timing") as f:
+            d = json.load(f)
+        os.unlink(out + ".timing")
+        return d
+    except (OSError, ValueError):
+        return {}
+
+
+def timing_note(t):
+    """Human-readable phase breakdown for the journal, or '' when nothing was produced.
+
+    first contact = tool startup + the user's reaction; swipe = assembly progress;
+    teardown = tool deinit + gdb quit (cannot be skipped without wedging the sensor).
+    'no frames produced' while the user swears they swiped is the wedge signature.
+    """
+    if not t:
+        return ""
+    if t.get("first_frame_s") is None:
+        return " [no frames produced]"
+    parts = ["first contact +%.1fs" % t["first_frame_s"]]
+    if t.get("last_frame_s") is not None:
+        parts.append("swipe %.1fs" % (t["last_frame_s"] - t["first_frame_s"]))
+        if t.get("gdb_exit_s") is not None:
+            parts.append("teardown %.1fs" % (t["gdb_exit_s"] - t["last_frame_s"]))
+    return " [" + ", ".join(parts) + "]"
+
+
+def retry_pause(sensor_side_bad):
+    """Clean captures can be retried sooner; only sensor-side badness needs the long pause."""
+    return RETRY_PAUSE if sensor_side_bad else RETRY_PAUSE_FAST
 
 
 def image_stats(w, h, data):
@@ -340,44 +380,43 @@ def deliver_cached(img, gen):
     with lock:
         state["capturing"] = False
         state["mode"] = None
+        deferred, state["deferred"] = state["deferred"], False
+    if deferred and state["wanted"]:
+        start_auth_capture("new finger request arrived during cached delivery")
 
 
-_lock_bus_paths = set()                     # user session buses we already follow
-_lock_bus_complained = set()
+_bus = None                                 # system bus, set in main(); used by the lock poll
 
-def watch_screen_lock():
-    """Best-effort follow of org.gnome.ScreenSaver on user session buses (secondary to
-    logind LockedHint — with dbus-broker, root cannot Hello() on a user session bus).
-    Failures are logged once per bus; the periodic refresh in main() retries."""
-    added = 0
-    for path in sorted(glob.glob("/run/user/*/bus")):
-        if path in _lock_bus_paths:
-            continue
-        try:
-            conn = dbus.bus.BusConnection("unix:path=" + path)
-            conn.add_signal_receiver(on_lock_changed, signal_name="ActiveChanged",
-                                     dbus_interface="org.gnome.ScreenSaver",
-                                     path="/org/gnome/ScreenSaver")
-        except dbus.DBusException as e:
-            if path not in _lock_bus_complained:
-                _lock_bus_complained.add(path)
-                log(f"session bus {path}: connect failed ({e}); using logind LockedHint instead")
-            continue
-        _lock_bus_paths.add(path)
-        added += 1
-        log(f"watching the screen lock on {path}")
-        GLib.timeout_add(3000, check_lock_state, conn)
-    return added
+def poll_lock_state():
+    """1 s poll of logind's LockedHint — the robust lock source.
 
-
-def check_lock_state(conn):
+    mutter sets LockedHint on every lock/unlock, and the system bus accepts root calls,
+    unlike the user session bus where dbus-broker refuses us (the old ScreenSaver
+    watcher never connected). Cheap: ListSessions + two property reads per session.
+    """
+    if _bus is None:
+        return True
     try:
-        ss = dbus.Interface(conn.get_object("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver"),
-                            "org.gnome.ScreenSaver")
-        on_lock_changed(bool(ss.GetActive()), initial=True)
+        mgr = dbus.Interface(_bus.get_object("org.freedesktop.login1", "/org/freedesktop/login1"),
+                             "org.freedesktop.login1.Manager")
+        locked = False
+        for sess in mgr.ListSessions():
+            # the tuple layout is (id, uid, name, seat, path) but has been mis-indexed
+            # before (sess[1] is the UInt32 uid!): find the object path by shape instead
+            paths = [x for x in sess
+                     if isinstance(x, str) and x.startswith("/org/freedesktop/login1/")]
+            if not paths:
+                continue
+            p = dbus.Interface(_bus.get_object("org.freedesktop.login1", paths[0]), PROPS)
+            if bool(p.Get(LOGIN1_SESSION, "LockedHint")) and bool(p.Get(LOGIN1_SESSION, "Active")):
+                locked = True
+                break
+        on_lock_changed(locked)
     except dbus.DBusException:
-        pass                                    # no gnome-shell on that bus (yet)
-    return False
+        pass                                    # logind hiccups must never kill the poll
+    except Exception as e:
+        log(f"lock poll error: {e!r}")
+    return True
 
 
 def maybe_prearm():
@@ -418,6 +457,7 @@ def capture_worker(gen):
     t0 = time.monotonic()
     delivered = False
     bad_streak = 0
+    sensor_bad = False
     attempts = 0
     try:
         if state["needs_reinit"]:
@@ -439,19 +479,28 @@ def capture_worker(gen):
                 log("capture cancelled (fprintd no longer waiting)"); return
             if attempts > 0:
                 # recovery pause between captures: rapid back-to-back captures make the
-                # sensor return tiny/degraded scans and trigger its own USB reset behaviour
-                time.sleep(RETRY_PAUSE)
-                log("retrying capture — swipe again if the finger prompt is still showing")
+                # sensor return tiny/degraded scans and trigger its own USB reset behaviour.
+                # Clean captures retry sooner — a missed swipe must not eat the verify window.
+                pause = retry_pause(sensor_bad)
+                sensor_bad = False
+                time.sleep(pause)
+                log("retrying capture after %.1fs — swipe again if the finger prompt is still "
+                    "showing" % pause)
             attempts += 1
-            budget = CAPTURE_TIMEOUT
             if prearm:
                 left = PREARM_WINDOW - (time.monotonic() - t0) + 5.0
                 budget = max(5.0, min(PREARM_BACKSTOP, left))
+            else:
+                # fprintd cancels the verify after ~30 s; short attempts keep every retry
+                # inside the window instead of burning it on one 18 s wait
+                budget = max(4.0, min(CAPTURE_TIMEOUT, AUTH_WINDOW - (time.monotonic() - t0)))
             rc = run_capture(out, timeout=budget)
+            timing = read_timing(out)
             if rc == EXIT_FORCED:
                 log("capture wrapper had to force-kill the vendor tool -> re-enumerating USB")
                 _recover("forced kill during capture")
                 bad_streak = 0
+                sensor_bad = True
                 continue
             with lock:
                 wanted = state["wanted"]
@@ -473,11 +522,12 @@ def capture_worker(gen):
                 elif sat is not None and sat > MAX_SAT:
                     reason = f"saturated frame ({sat:.1f}%)"
                 if reason:
-                    log(f"rejected scan {img[0]}x{img[1]}: {reason}")
+                    log(f"rejected scan {img[0]}x{img[1]}: {reason}{timing_note(timing)}")
                     archive_scan(*img, std, sat, prefix="rej-")
                     ok = False
                     sensor_side = ((std is not None and std > MAX_STD) or
                                    (sat is not None and sat > MAX_SAT))
+                    sensor_bad = sensor_side
                     bad_streak = bad_streak + 1 if sensor_side else 0
                     if bad_streak >= 2:
                         log("two sensor-side bad frames in a row -> trying USB re-enumeration")
@@ -490,7 +540,8 @@ def capture_worker(gen):
                         try:
                             deliver(*img)
                             delivered = True
-                            log(f"delivered scan {img[0]}x{img[1]} {stats} after {time.monotonic()-t0:.1f}s")
+                            log(f"delivered scan {img[0]}x{img[1]} {stats} after "
+                                f"{time.monotonic()-t0:.1f}s{timing_note(timing)}")
                             return
                         except OSError as e:
                             log(f"deliver failed: {e}"); return
@@ -501,7 +552,10 @@ def capture_worker(gen):
                         return
             if not ok:
                 last_attempt = attempts >= MAX_ATTEMPTS
-                log("no usable finger scan" + (" (give up)" if last_attempt else ", retrying"))
+                log("no usable finger scan" + (" (give up)" if last_attempt else ", retrying")
+                    + timing_note(timing))
+    except Exception as e:
+        log(f"capture worker error: {e!r}")
     finally:
         try: os.unlink(out)
         except OSError: pass
@@ -583,8 +637,10 @@ def _on_sigterm(signum, frame):
     raise SystemExit(0)
 
 def main():
+    global _bus
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
+    _bus = bus
     bus.add_signal_receiver(on_props_changed, signal_name="PropertiesChanged", dbus_interface=PROPS,
                             bus_name=BUS_NAME, path_keyword="path")
     bus.add_signal_receiver(on_verify_selected, signal_name="VerifyFingerSelected", dbus_interface=DEV_IFACE,
@@ -601,27 +657,10 @@ def main():
                 if bool(p.Get(DEV_IFACE, "finger-needed")): on_needed("pending at startup")
         except dbus.DBusException: pass
         return False
-    def check_initial_locked():                         # started while the screen is locked?
-        try:
-            mgr = dbus.Interface(bus.get_object("org.freedesktop.login1", "/org/freedesktop/login1"),
-                                 "org.freedesktop.login1.Manager")
-            for sess in mgr.ListSessions():             # tuples are wider than documented
-                path = sess[1]
-                p = dbus.Interface(bus.get_object("org.freedesktop.login1", path), PROPS)
-                if bool(p.Get(LOGIN1_SESSION, "LockedHint")) and bool(p.Get(LOGIN1_SESSION, "Active")):
-                    on_lock_changed(True, initial=True)
-                    break
-        except Exception:                               # a GLib callback must never crash the loop
-            pass
-        return False
-    def refresh_lock_watch():                           # new sessions / re-login
-        watch_screen_lock()
-        return True
     signal.signal(signal.SIGTERM, _on_sigterm)
     GLib.timeout_add(1500, check_initial)
-    GLib.timeout_add(800, check_initial_locked)
-    watch_screen_lock()
-    GLib.timeout_add_seconds(120, refresh_lock_watch)
+    poll_lock_state()                                   # covers "started while already locked"
+    GLib.timeout_add(1000, poll_lock_state)
     log("idle; waiting for fprintd to need a finger")
     try:
         GLib.MainLoop().run()

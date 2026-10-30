@@ -14,7 +14,7 @@ Shutdown is deliberately polite: SIGTERM first, wait, and SIGKILL only as a last
 Hard-killing the vendor tool mid-session can leave the sensor waiting for a USB transfer
 that never completes (the "stuck until power-off" state).
 """
-import os, signal, struct, subprocess, sys, tempfile, time
+import json, os, signal, struct, subprocess, sys, tempfile, time
 import numpy as np
 
 RE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -119,6 +119,50 @@ def _on_sigterm(signum, frame):
     raise SystemExit(EXIT_CANCELLED)
 
 
+def _watch_assembly(proc, asm, timeout):
+    """Run proc to completion while following the harvest file.
+
+    The gdb breakpoint rewrites the file on every assembled-frame callback, so its
+    mtime marks first finger contact, swipe progress, and the moment the tool stops
+    producing frames. The teardown tail (tool deinit + gdb quit) cannot be skipped:
+    the vendor tool must deinit the sensor itself or the reader wedges.
+    Returns (rc, phase); rc is None on timeout. Phase values are seconds since spawn.
+    """
+    t0 = time.monotonic()
+    phase = {"first_frame_s": None, "last_frame_s": None, "gdb_exit_s": None}
+    prev = object()
+    while True:
+        rc = proc.poll()
+        try:
+            st = os.stat(asm)
+            if st.st_size >= 8 and st.st_mtime != prev:
+                now = time.monotonic() - t0
+                if phase["first_frame_s"] is None:
+                    phase["first_frame_s"] = now
+                phase["last_frame_s"] = now
+                prev = st.st_mtime
+        except OSError:
+            pass
+        if rc is not None:
+            phase["gdb_exit_s"] = time.monotonic() - t0
+            return rc, phase
+        if time.monotonic() - t0 >= timeout:
+            return None, phase
+        time.sleep(0.05)
+
+
+def _write_timing(out, phase, dims=None):
+    """Persist phase timings next to the capture for the bridge to log."""
+    try:
+        d = dict(phase)
+        if dims:
+            d.update(dims)
+        with open(out + ".timing", "w") as f:
+            json.dump(d, f)
+    except OSError:
+        pass
+
+
 def main():
     global _proc
     out = sys.argv[1]
@@ -140,18 +184,23 @@ def main():
 
     _proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
+    phase = {}
     try:
-        _proc.wait(timeout=timeout)
+        rc, phase = _watch_assembly(_proc, asm, timeout)
+        if rc is None:
+            raise subprocess.TimeoutExpired(cmd, timeout)
     except subprocess.TimeoutExpired:
         forced = stop_gdb(_proc)
         print("capture timed out after %.0fs%s" % (timeout, " (forced kill)" if forced else ""),
               file=sys.stderr)
+        _write_timing(out, phase)
         try: os.unlink(asm)
         except OSError: pass
         return EXIT_FORCED if forced else EXIT_ERROR
     except SystemExit:
         forced = stop_gdb(_proc)
         print("capture cancelled%s" % (" (forced kill)" if forced else ""), file=sys.stderr)
+        _write_timing(out, phase)
         try: os.unlink(asm)
         except OSError: pass
         return EXIT_FORCED if forced else EXIT_CANCELLED
@@ -162,6 +211,7 @@ def main():
     # gdb exited on its own; make sure it did not leave the vendor session behind.
     if reap_session(1.0):
         print("stale sensor session cleaned after capture", file=sys.stderr)
+        _write_timing(out, phase)
         try: os.unlink(asm)
         except OSError: pass
         return EXIT_FORCED
@@ -169,6 +219,7 @@ def main():
     try:
         if os.path.getsize(asm) < 16:
             print("no assembled image (no finger?)", file=sys.stderr)
+            _write_timing(out, phase)
             return EXIT_NO_IMAGE
         d = open(asm, "rb").read()
     finally:
@@ -179,6 +230,7 @@ def main():
     with open(out, "wb") as f:
         f.write(f"P5\n{w} {h}\n255\n".encode())
         f.write(np.ascontiguousarray(img).tobytes())
+    _write_timing(out, phase, {"cols": w, "rows": h})
     print(f"captured assembled {w}x{h} -> {out}")
     return EXIT_OK
 

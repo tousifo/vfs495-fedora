@@ -2,9 +2,11 @@
 Description=VFS495 physical capture -> fprintd virtual-image bridge
 Documentation=https://github.com/saifulmd0/vfs495-linux
 After=fprintd.service
+# never enter the start-limit lockout: fingerprint must come back on its own
+StartLimitIntervalSec=0
 [Service]
 ExecStart=/usr/bin/python3 /usr/local/libexec/vfs495-fedora-bridge.py
 Restart=on-failure
-RestartSec=2
+RestartSec=1
 [Install]
 WantedBy=multi-user.target

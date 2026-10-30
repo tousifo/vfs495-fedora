@@ -10,7 +10,7 @@ whose command line merely mentions those names. Nothing else may ever be
 signalled — matching is by /proc/*/exe, so at worst a real stale capture
 leftover is cleaned up, which is exactly what these functions are for.
 """
-import os, shutil, signal, subprocess, sys, tempfile, time, unittest
+import json, os, shutil, signal, subprocess, sys, tempfile, time, unittest
 
 RE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(RE, "tools"))
@@ -319,6 +319,35 @@ class PrearmTest(unittest.TestCase):
         with bridge.lock:
             self.assertEqual(bridge.state["mode"], "auth")
             self.assertTrue(bridge.state["capturing"])
+
+
+class HelpersTest(unittest.TestCase):
+    """Phase-timing plumbing and the adaptive retry pause."""
+
+    def test_retry_pause_selection(self):
+        self.assertEqual(bridge.retry_pause(False), bridge.RETRY_PAUSE_FAST)
+        self.assertEqual(bridge.retry_pause(True), bridge.RETRY_PAUSE)
+
+    def test_read_timing_parses_and_consumes(self):
+        tmp = tempfile.mkdtemp(prefix="vfs495-timing-")
+        try:
+            out = os.path.join(tmp, "cap.pgm")
+            with open(out + ".timing", "w") as f:
+                json.dump({"first_frame_s": 1.5, "last_frame_s": 3.0, "gdb_exit_s": 3.6}, f)
+            t = bridge.read_timing(out)
+            self.assertEqual(t["first_frame_s"], 1.5)
+            self.assertFalse(os.path.exists(out + ".timing"))   # consumed after reading
+            self.assertEqual(bridge.read_timing(out), {})       # gone -> {} not a crash
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_timing_note(self):
+        self.assertEqual(bridge.timing_note({}), "")
+        self.assertIn("no frames", bridge.timing_note({"first_frame_s": None}))
+        note = bridge.timing_note({"first_frame_s": 1.0, "last_frame_s": 3.0, "gdb_exit_s": 3.5})
+        self.assertIn("first contact +1.0s", note)
+        self.assertIn("swipe 2.0s", note)
+        self.assertIn("teardown 0.5s", note)
 
 
 if __name__ == "__main__":
