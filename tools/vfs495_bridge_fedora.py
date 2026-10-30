@@ -31,7 +31,9 @@ RUNTIME = os.path.normpath(os.path.dirname(CAPTURE) + "/../runtime")
 VENDOR = RUNTIME + "/bin/validity-sensor-unlocked"
 HARVEST = RUNTIME + "/harvest_assembled.py"
 MIN_ROWS = 180                                # a real swipe assembles to ~200x300; tiny = no usable print
-MAX_STD = 85                                # extreme only: real swipes measured 34-80, broken frame 91/99
+MAX_STD = 85                                # sensor-health marker only (not a delivery gate — see
+                                            # the gate comment in capture_worker)
+SENSOR_FLAT_STD = 15                        # below this the frame is flat: the sensor read nothing
 MAX_SAT = 25                                # % of pixels at the extremes (saturated) — healthy <7%
 MIN_COVER = int(os.environ.get("VFS495_MIN_COVER", "60"))  # % of frame covered by the print.
                                                             # Calibrated: at >=61% matches occur,
@@ -518,16 +520,17 @@ def capture_worker(gen):
                               "its stuck state (then: full power-off, not a reboot)")
                 elif cover is not None and cover < MIN_COVER:
                     reason = f"partial contact ({cover:.0f}% of frame covered — press the whole finger flat)"
-                elif std is not None and std > MAX_STD:
-                    reason = f"degenerate frame (std {std:.0f})"
-                elif sat is not None and sat > MAX_SAT:
-                    reason = f"saturated frame ({sat:.1f}%)"
+                # std/saturation do NOT block delivery: measured 2026-10-31, a std 88 /
+                # sat 26 login frame scored 85/40 (MATCH) while flat sensor-junk frames
+                # (std 11) score 0-6/40 and are caught by the cover gate anyway. The
+                # 40/40 matcher is the real judge; a degraded frame that matches beats a
+                # retry the user never swipes for.
+                sensor_side = ((std is not None and (std > MAX_STD or std < SENSOR_FLAT_STD)) or
+                               (sat is not None and sat > MAX_SAT))
                 if reason:
                     log(f"rejected scan {img[0]}x{img[1]}: {reason}{timing_note(timing)}")
                     archive_scan(*img, std, sat, prefix="rej-")
                     ok = False
-                    sensor_side = ((std is not None and std > MAX_STD) or
-                                   (sat is not None and sat > MAX_SAT))
                     sensor_bad = sensor_side
                     bad_streak = bad_streak + 1 if sensor_side else 0
                     if bad_streak >= 2:
@@ -535,14 +538,24 @@ def capture_worker(gen):
                         _recover("repeated degenerate frames")
                         bad_streak = 0
                 else:
-                    bad_streak = 0
+                    sensor_bad = sensor_side
+                    if sensor_side:
+                        bad_streak += 1
+                        if bad_streak >= 2:
+                            log("two sensor-side bad frames in a row -> USB re-enumeration "
+                                "(delivery is unaffected)")
+                            _recover("repeated degenerate frames")
+                            bad_streak = 0
+                    else:
+                        bad_streak = 0
                     archive_scan(*img, std, sat)
                     if wanted:
                         try:
                             deliver(*img)
                             delivered = True
                             log(f"delivered scan {img[0]}x{img[1]} {stats} after "
-                                f"{time.monotonic()-t0:.1f}s{timing_note(timing)}")
+                                f"{time.monotonic()-t0:.1f}s{timing_note(timing)}"
+                                + (" [degraded frame — matcher decides]" if sensor_side else ""))
                             return
                         except OSError as e:
                             log(f"deliver failed: {e}"); return
